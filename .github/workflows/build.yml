@@ -3,7 +3,7 @@ name: Build yt-dlp Android Binaries
 on:
   workflow_dispatch:        # manual trigger button
   schedule:
-    - cron: "0 0 * * 1"    # auto-rebuild every Monday
+    - cron: "0 0 * * 1"    # auto-rebuild every Monda
 
 jobs:
   build:
