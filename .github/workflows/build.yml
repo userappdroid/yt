@@ -2,106 +2,47 @@ name: Build yt-dlp Android Binaries
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "0 0 * * 1"
+  push:
 
 jobs:
-  build-arm64:
+  build:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+
+    strategy:
+      matrix:
+        abi: [armeabi-v7a]
+
     steps:
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+      - name: Checkout repo
+        uses: actions/checkout@v4
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Build yt-dlp (arm64-v8a)
+      - name: Install dependencies
         run: |
-          docker run --rm --platform linux/arm64 \
-            -v ${{ github.workspace }}:/output \
-            python:3.11-slim bash -c "
-              set -e
-              apt-get update -qq
-              apt-get install -y -qq binutils file
-              pip install --quiet pyinstaller yt-dlp
-              echo 'from yt_dlp import main' > /tmp/main.py
-              echo 'if __name__ == \"__main__\": main()' >> /tmp/main.py
-              pyinstaller \
-                --onefile \
-                --clean \
-                --strip \
-                --name yt-dlp-arm64-v8a \
-                --collect-all yt_dlp \
-                /tmp/main.py
-              cp /dist/yt-dlp-arm64-v8a /output/
-            "
+          sudo apt-get update
+          sudo apt-get install -y wget unzip build-essential
 
-      - name: Upload arm64 artifact
+      - name: Download Android NDK
+        run: |
+          wget https://dl.google.com/android/repository/android-ndk-r26d-linux.zip
+          unzip android-ndk-r26d-linux.zip
+          echo "NDK=$PWD/android-ndk-r26d" >> $GITHUB_ENV
+
+      - name: Install Python build tools
+        run: |
+          python3 -m pip install --upgrade pip
+          pip install nuitka yt-dlp
+
+      - name: Build yt-dlp for Android
+        run: |
+          python -m nuitka \
+            --onefile \
+            --standalone \
+            --lto=yes \
+            --output-filename=yt-dlp-${{ matrix.abi }} \
+            -m yt_dlp
+
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: yt-dlp-arm64-v8a
-          path: yt-dlp-arm64-v8a
-          retention-days: 90
-
-  build-armv7:
-    runs-on: ubuntu-latest
-    needs: build-arm64        # ← runs AFTER arm64 finishes
-    timeout-minutes: 60
-    steps:
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Build yt-dlp (armeabi-v7a)
-        run: |
-          docker run --rm --platform linux/arm/v7 \
-            -v ${{ github.workspace }}:/output \
-            python:3.11-slim bash -c "
-              set -e
-              apt-get update -qq
-              apt-get install -y -qq binutils file
-              pip install --quiet pyinstaller yt-dlp
-              echo 'from yt_dlp import main' > /tmp/main.py
-              echo 'if __name__ == \"__main__\": main()' >> /tmp/main.py
-              pyinstaller \
-                --onefile \
-                --clean \
-                --strip \
-                --name yt-dlp-armeabi-v7a \
-                --collect-all yt_dlp \
-                /tmp/main.py
-              cp /dist/yt-dlp-armeabi-v7a /output/
-            "
-
-      - name: Upload armv7 artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: yt-dlp-armeabi-v7a
-          path: yt-dlp-armeabi-v7a
-          retention-days: 90
-
-  release:
-    needs: [build-arm64, build-armv7]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
-        with:
-          merge-multiple: true
-
-      - name: List files
-        run: ls -lh
-
-      - name: Create Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: build-${{ github.run_number }}
-          name: "yt-dlp Android - Build #${{ github.run_number }}"
-          files: |
-            yt-dlp-arm64-v8a
-            yt-dlp-armeabi-v7a
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          name: yt-dlp-${{ matrix.abi }}
+          path: yt-dlp-${{ matrix.abi }}
