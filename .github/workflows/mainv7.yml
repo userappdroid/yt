@@ -24,10 +24,13 @@ jobs:
               apt-get update -qq
               apt-get install -y -qq binutils file gcc g++ make zlib1g-dev patchelf
 
-              echo '==> upgrade pip'
-              pip install --upgrade pip setuptools wheel
+              echo '==> fix pkg_resources'
+              pip install --upgrade pip setuptools==69.5.1 wheel
 
-              echo '==> install pyinstaller from source'
+              echo '==> verify pkg_resources'
+              python -c 'import pkg_resources; print(pkg_resources.__file__)'
+
+              echo '==> install pyinstaller'
               pip install pyinstaller==5.13.2
 
               echo '==> install yt-dlp'
