@@ -1,0 +1,94 @@
+name: Build yt-dlp Android Binaries
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 0 * * 1"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - abi: arm64-v8a
+            platform: linux/arm64
+          - abi: armeabi-v7a
+            platform: linux/arm/v7
+
+    steps:
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build yt-dlp (${{ matrix.abi }})
+        run: |
+          docker run --rm --platform ${{ matrix.platform }} \
+            -v ${{ github.workspace }}:/output \
+            python:3.11-slim bash -c "
+              set -e
+              echo '==> Installing dependencies'
+              apt-get update -qq
+              apt-get install -y -qq binutils file
+
+              echo '==> Installing Python packages'
+              pip install --quiet pyinstaller yt-dlp
+
+              echo '==> Creating entrypoint'
+              echo 'from yt_dlp import main' > /tmp/main.py
+              echo 'if __name__ == \"__main__\": main()' >> /tmp/main.py
+
+              echo '==> Running PyInstaller'
+              pyinstaller \
+                --onefile \
+                --clean \
+                --strip \
+                --name yt-dlp-${{ matrix.abi }} \
+                --collect-all yt_dlp \
+                /tmp/main.py
+
+              echo '==> Checking output'
+              ls -lh /dist/
+              file /dist/yt-dlp-${{ matrix.abi }}
+
+              echo '==> Copying to output'
+              cp /dist/yt-dlp-${{ matrix.abi }} /output/
+              echo '==> Done'
+            "
+
+      - name: Verify binary exists
+        run: |
+          ls -lh ${{ github.workspace }}/yt-dlp-${{ matrix.abi }}
+          file ${{ github.workspace }}/yt-dlp-${{ matrix.abi }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: yt-dlp-${{ matrix.abi }}
+          path: yt-dlp-${{ matrix.abi }}
+          retention-days: 90
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: List files
+        run: ls -lh
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: "yt-dlp Android - Build #${{ github.run_number }}"
+          files: |
+            yt-dlp-arm64-v8a
+            yt-dlp-armeabi-v7a
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
