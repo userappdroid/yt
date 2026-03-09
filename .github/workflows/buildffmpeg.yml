@@ -1,0 +1,182 @@
+name: Android CI
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  JAVA_VERSION: '17'
+  NDK_VERSION: 'r26d'
+
+jobs:
+  # ── Build FFmpeg native libraries ────────────────────────────────────────────
+  build-ffmpeg-native:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Cache FFmpeg native libs
+        id: cache-ffmpeg
+        uses: actions/cache@v4
+        with:
+          path: core-video/src/main/jniLibs
+          key: ffmpeg-${{ hashFiles('scripts/build_ffmpeg.sh') }}-${{ env.NDK_VERSION }}
+
+      - name: Setup NDK
+        if: steps.cache-ffmpeg.outputs.cache-hit != 'true'
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: ${{ env.NDK_VERSION }}
+          add-to-path: true
+
+      - name: Build FFmpeg for arm64-v8a and x86_64
+        if: steps.cache-ffmpeg.outputs.cache-hit != 'true'
+        run: |
+          chmod +x scripts/build_ffmpeg.sh
+          ./scripts/build_ffmpeg.sh \
+            --abi arm64-v8a,x86_64 \
+            --enable-gpl \
+            --enable-libx264 \
+            --enable-libmp3lame \
+            --enable-libvpx \
+            --output core-video/src/main/jniLibs
+
+      - name: Upload native libs artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-native-libs
+          path: core-video/src/main/jniLibs
+          retention-days: 7
+
+  # ── Lint & Unit Tests ────────────────────────────────────────────────────────
+  lint-and-test:
+    runs-on: ubuntu-latest
+    needs: build-ffmpeg-native
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Download native libs
+        uses: actions/download-artifact@v4
+        with:
+          name: ffmpeg-native-libs
+          path: core-video/src/main/jniLibs
+
+      - name: Cache Gradle packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ hashFiles('**/*.gradle.kts', '**/libs.versions.toml') }}
+          restore-keys: gradle-
+
+      - name: Run lint
+        run: ./gradlew lint
+
+      - name: Run domain unit tests
+        run: ./gradlew :core-domain:test :core-data:test :feature-editor:test
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: '**/build/reports/tests/'
+
+  # ── Effect Parity Validation ─────────────────────────────────────────────────
+  effect-parity:
+    runs-on: ubuntu-latest
+    needs: lint-and-test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Validate effect preview/export parity
+        run: ./gradlew :core-video:validateEffectParity
+
+      - name: Upload parity report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: parity-report
+          path: core-video/build/reports/parity/
+
+  # ── Assemble Debug APK ───────────────────────────────────────────────────────
+  assemble-debug:
+    runs-on: ubuntu-latest
+    needs: effect-parity
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Download native libs
+        uses: actions/download-artifact@v4
+        with:
+          name: ffmpeg-native-libs
+          path: core-video/src/main/jniLibs
+
+      - name: Assemble debug APK
+        run: ./gradlew :app:assembleDebug
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
+
+  # ── Assemble Release APK ─────────────────────────────────────────────────────
+  assemble-release:
+    runs-on: ubuntu-latest
+    needs: assemble-debug
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Download native libs
+        uses: actions/download-artifact@v4
+        with:
+          name: ffmpeg-native-libs
+          path: core-video/src/main/jniLibs
+
+      - name: Decode signing keystore
+        run: echo "${{ secrets.SIGNING_KEYSTORE_BASE64 }}" | base64 -d > keystore.jks
+
+      - name: Assemble release APK
+        env:
+          KEYSTORE_PATH: ${{ github.workspace }}/keystore.jks
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
+        run: ./gradlew :app:assembleRelease
+
+      - name: Upload release APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-apk
+          path: app/build/outputs/apk/release/
