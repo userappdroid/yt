@@ -1,0 +1,1367 @@
+{
+  "$schema": "https://raw.githubusercontent.com/cyberIyke/schemas/main/sniffer-rules.v4.json",
+  "schemaVersion": 4,
+  "lastUpdated": 1791801361711,
+  "rules": [
+    {
+      "id": "tiktok",
+      "platform": "TikTok",
+      "priority": 100,
+      "urlPatterns": [
+        "(?i)^https?://(?:www\\.|m\\.)?tiktok\\.com/(?:embed|(?:share|@(?<userId>[\\w.-]+)?)/video)/(?<id>\\d+)",
+        "(?i)^https?://(?:(?:vm|vt)\\.tiktok\\.com|(?:www\\.)?tiktok\\.com/t)/(?<shortId>\\w+)"
+      ],
+      "pipeline": [
+        {
+          "step": "RESOLVE_REDIRECT",
+          "condition": "{{shortId}} != null",
+          "request": {
+            "url": "https://vm.tiktok.com/{{shortId}}/",
+            "httpMethod": "HEAD",
+            "headers": {
+              "User-Agent": "facebookexternalhit/1.1"
+            },
+            "followRedirects": false
+          },
+          "extractVariables": {
+            "id": {
+              "source": "HEADER:Location",
+              "regex": "/video/(?<val>\\d+)",
+              "regexGroup": "val"
+            }
+          }
+        },
+        {
+          "step": "FETCH_WEB_DATA",
+          "request": {
+            "url": "https://www.tiktok.com/@_/video/{{id}}",
+            "httpMethod": "GET",
+            "headers": {
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+              "Accept-Language": "en-US,en;q=0.9"
+            }
+          },
+          "extractVariables": {
+            "rehydrationJson": {
+              "regex": "<script[^>]+\\bid=\"__UNIVERSAL_DATA_FOR_REHYDRATION__\"[^>]*>(?<val>\\{.+?\\})</script>",
+              "regexGroup": "val"
+            }
+          }
+        }
+      ],
+      "contextRoot": "$.__DEFAULT_SCOPE__['webapp.video-detail'].itemInfo.itemStruct",
+      "metadata": {
+        "title": {
+          "jsonPath": "$.desc",
+          "defaultValue": "TikTok Video"
+        },
+        "description": {
+          "jsonPath": "$.desc"
+        },
+        "duration": {
+          "jsonPath": "$.video.duration",
+          "type": "INTEGER"
+        },
+        "uploader": {
+          "jsonPath": "$.author.uniqueId"
+        },
+        "uploaderId": {
+          "jsonPath": "$.author.id"
+        },
+        "timestamp": {
+          "jsonPath": "$.createTime",
+          "type": "INTEGER"
+        },
+        "viewCount": {
+          "jsonPath": "$.stats.playCount",
+          "type": "INTEGER"
+        },
+        "likeCount": {
+          "jsonPath": "$.stats.diggCount",
+          "type": "INTEGER"
+        },
+        "thumbnail": {
+          "jsonPath": "$.video.originCover",
+          "fallbackJsonPath": "$.video.cover"
+        }
+      },
+      "streams": [
+        {
+          "type": "PROGRESSIVE",
+          "protocol": "HTTP",
+          "container": "mp4",
+          "formatId": "direct-nowatermark",
+          "selector": {
+            "jsonPath": "$.video.playAddr"
+          },
+          "headers": {
+            "Referer": "https://www.tiktok.com/"
+          },
+          "validation": {
+            "mustBeAbsoluteUrl": true,
+            "expectedScheme": "https"
+          }
+        },
+        {
+          "type": "PROGRESSIVE_MULTI",
+          "protocol": "HTTP",
+          "container": "mp4",
+          "selector": {
+            "iterateArray": "$.video.bitrateInfo",
+            "urlPath": "$.PlayAddr.UrlList[0]",
+            "filesizePath": "$.PlayAddr.DataSize",
+            "formatKeyPath": "$.PlayAddr.UrlKey"
+          },
+          "transformations": [
+            {
+              "field": "height",
+              "source": "formatKeyPath",
+              "regex": "_(?<val>\\d+)p_",
+              "regexGroup": "val",
+              "type": "INTEGER"
+            },
+            {
+              "field": "bitrate",
+              "source": "formatKeyPath",
+              "regex": "_(\\d+)p_(?<val>\\d+)",
+              "regexGroup": "val",
+              "type": "INTEGER"
+            }
+          ],
+          "headers": {
+            "Referer": "https://www.tiktok.com/"
+          },
+          "validation": {
+            "mustBeAbsoluteUrl": true,
+            "expectedScheme": "https",
+            "rejectPattern": "bytevc2"
+          }
+        },
+        {
+          "type": "AUDIO_ONLY",
+          "protocol": "HTTP",
+          "container": "m4a",
+          "formatId": "audio-original",
+          "isAudioOnlyOverride": true,
+          "selector": {
+            "jsonPath": "$.music.playUrl"
+          },
+          "headers": {
+            "Referer": "https://www.tiktok.com/"
+          },
+          "validation": {
+            "mustBeAbsoluteUrl": true,
+            "expectedScheme": "https"
+          }
+        }
+      ],
+      "volatileFields": [
+        {
+          "path": "pipeline[1].extractVariables.rehydrationJson.regex",
+          "field": "__UNIVERSAL_DATA_FOR_REHYDRATION__ script id",
+          "volatility": "high",
+          "refreshStrategy": "MANUAL_UPDATE_REQUIRED",
+          "note": "TikTok has repeatedly changed the hydration container TikTok's own web client uses (SIGI_STATE in older builds, this id more recently). When this step starts returning empty, check the live page source for the current script id/attribute before anything else."
+        }
+      ],
+      "operationalNotes": [
+        "Treat 'Unable to extract rehydration data' as expected, recurring noise, not an edge case -- it is the single most common failure mode reported against equivalent open-source extractors for this exact endpoint, usually several times a year.",
+        "playAddr/bitrateInfo URLs are short-lived signed CDN links; resolve the stream URL and begin the download promptly rather than caching it."
+      ],
+      "retryPolicy": {
+        "maxAttempts": 4,
+        "backoffMs": 1000,
+        "backoffMultiplier": 2.0
+      },
+      "fallback": {
+        "useGenericFallback": true
+      }
+    },
+    {
+      "id": "instagram",
+      "platform": "Instagram",
+      "priority": 100,
+      "urlPatterns": [
+        "(?i)^https?://(?:www\\.)?instagram\\.com(?:/(?!share/)[^/?#]+)?/(?:p|tv|reels?|reel)/(?<id>[a-zA-Z0-9_-]+)"
+      ],
+      "transformations": [
+        {
+          "variable": "mediaId",
+          "source": "id",
+          "type": "BASE64_CUSTOM_DECODE",
+          "alphabet": "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+        }
+      ],
+      "pipeline": [
+        {
+          "step": "INIT_SESSION",
+          "request": {
+            "url": "https://www.instagram.com/",
+            "httpMethod": "GET",
+            "headers": {
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+            }
+          },
+          "extractVariables": {
+            "lsdToken": {
+              "regex": "\\[\"LSD\",\\[\\],\\{\"token\":\"([^\"]+)\"",
+              "regexGroup": 1
+            }
+          }
+        },
+        {
+          "step": "QUERY_GRAPHQL",
+          "request": {
+            "url": "https://www.instagram.com/api/graphql",
+            "httpMethod": "POST",
+            "headers": {
+              "X-IG-App-ID": "936619743392459",
+              "X-FB-LSD": "{{lsdToken}}",
+              "Origin": "https://www.instagram.com",
+              "Referer": "https://www.instagram.com/p/{{id}}/",
+              "Content-Type": "application/x-www-form-urlencoded",
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+            },
+            "body": "lsd={{lsdToken}}&fb_api_caller_class=RelayModern&fb_api_req_friendly_name=PolarisLoggedOutDesktopWWWPostRootContentQuery&server_timestamps=true&variables=%7B%22media_id%22%3A%22{{mediaId}}%22%7D&doc_id=27130156389949648"
+          }
+        }
+      ],
+      "metadata": {
+        "title": {
+          "jsonPath": "$.data.xig_polaris_media.if_not_gated_logged_out.caption.text",
+          "fallbackFormat": "Instagram Video by {{uploader}}"
+        },
+        "description": {
+          "jsonPath": "$.data.xig_polaris_media.if_not_gated_logged_out.caption.text"
+        },
+        "duration": {
+          "jsonPath": "$.data.xig_polaris_media.if_not_gated_logged_out.video_duration",
+          "type": "FLOAT"
+        },
+        "uploader": {
+          "jsonPath": "$.data.xig_polaris_media.if_not_gated_logged_out.user.full_name"
+        },
+        "uploaderId": {
+          "jsonPath": "$.data.xig_polaris_media.if_not_gated_logged_out.user.username"
+        },
+        "timestamp": {
+          "jsonPath": "$.data.xig_polaris_media.if_not_gated_logged_out.taken_at",
+          "type": "INTEGER"
+        },
+        "thumbnail": {
+          "jsonPath": "$.data.xig_polaris_media.if_not_gated_logged_out.image_versions2.candidates[0].url"
+        },
+        "likeCount": {
+          "jsonPath": "$.data.xig_polaris_media.if_not_gated_logged_out.like_count",
+          "type": "INTEGER"
+        }
+      },
+      "streams": [
+        {
+          "type": "PROGRESSIVE",
+          "protocol": "HTTP",
+          "container": "mp4",
+          "selector": {
+            "iterateArray": "$.data.xig_polaris_media.if_not_gated_logged_out.video_versions",
+            "urlPath": "$.url",
+            "widthPath": "$.width",
+            "heightPath": "$.height",
+            "formatIdPath": "$.id"
+          },
+          "headers": {
+            "Referer": "https://www.instagram.com/"
+          },
+          "validation": {
+            "mustBeAbsoluteUrl": true,
+            "expectedScheme": "https"
+          }
+        },
+        {
+          "type": "DASH",
+          "protocol": "DASH",
+          "container": "mp4",
+          "selector": {
+            "xmlStringJsonPath": "$.data.xig_polaris_media.if_not_gated_logged_out.video_dash_manifest"
+          },
+          "headers": {
+            "Referer": "https://www.instagram.com/"
+          }
+        }
+      ],
+      "volatileFields": [
+        {
+          "path": "pipeline[1].request.body",
+          "field": "doc_id=27130156389949648",
+          "volatility": "high",
+          "refreshStrategy": "MANUAL_UPDATE_REQUIRED",
+          "note": "Instagram's GraphQL persisted-query doc_id for this query rotates on their own release cadence, typically every few months, and the request simply 404s/400s afterward with no useful error body."
+        },
+        {
+          "path": "pipeline[1].request.headers.X-IG-App-ID",
+          "field": "936619743392459",
+          "volatility": "low",
+          "refreshStrategy": "MANUAL_UPDATE_REQUIRED",
+          "note": "Changes far less often than doc_id but should be re-checked if the whole pipeline starts failing at the INIT_SESSION step."
+        }
+      ],
+      "operationalNotes": [
+        "Instagram deprecated the public oEmbed endpoint for non-approved apps, so the generic fallback here is og:meta scraping only, not oEmbed.",
+        "Private/age-restricted/login-required posts will not resolve through this pipeline; that's a content-gating wall, not a bug in the rule."
+      ],
+      "fallback": {
+        "useGenericFallback": true
+      }
+    },
+    {
+      "id": "facebook",
+      "platform": "Facebook",
+      "priority": 100,
+      "urlPatterns": [
+        "(?i)^https?://(?:[\\w-]+\\.)?facebook\\.com/(?:[^#]*#!/)?(?:permalink\\.php|video/video\\.php|photo\\.php|video\\.php|video/embed|story\\.php|watch(?:/live)?/?)\\?(?:.*?)?(?:v|video_id|story_fbid)=(?<id>pfbid[A-Za-z0-9]+|\\d+)",
+        "(?i)^https?://(?:[\\w-]+\\.)?facebook\\.com/(?:[^/]+/videos/(?:[^/]+/)?|[^/]+/posts/|groups/[^/]+/permalink/|reel/|share/v/|share/r/)(?<id>pfbid[A-Za-z0-9]+|\\d+)",
+        "^facebook:(?<id>\\d+)"
+      ],
+      "pipeline": [
+        {
+          "step": "FETCH_PAGE",
+          "request": {
+            "url": "https://www.facebook.com/video/video.php?v={{id}}",
+            "httpMethod": "GET",
+            "headers": {
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+              "Accept-Language": "en-US,en;q=0.9"
+            }
+          },
+          "extractVariables": {
+            "embeddedJson": {
+              "regex": "data-sjs>(\\{.*?ScheduledServerJS.*?\\})</script>",
+              "regexGroup": 1
+            }
+          }
+        }
+      ],
+      "metadata": {
+        "title": {
+          "jsonPath": "$..attachments[?(@.media.__typename=='Video')].media.title",
+          "fallbackRegex": "<meta\\s+property=\"og:title\"\\s+content=\"([^\"]+)\"",
+          "defaultValue": "Facebook Video"
+        },
+        "description": {
+          "jsonPath": "$..attachments[?(@.media.__typename=='Video')].media.creation_story.message.text",
+          "fallbackRegex": "<meta\\s+property=\"og:description\"\\s+content=\"([^\"]+)\""
+        },
+        "duration": {
+          "jsonPath": "$..playable_duration_in_ms",
+          "transform": "DIVIDE_1000",
+          "type": "FLOAT"
+        },
+        "thumbnail": {
+          "jsonPath": "$..preferred_thumbnail.image.uri",
+          "fallbackRegex": "<meta\\s+property=\"og:image\"\\s+content=\"([^\"]+)\""
+        },
+        "uploader": {
+          "jsonPath": "$..attachments[?(@.media.__typename=='Video')].media.owner.name"
+        },
+        "uploaderId": {
+          "jsonPath": "$..attachments[?(@.media.__typename=='Video')].media.owner.id"
+        }
+      },
+      "streams": [
+        {
+          "type": "PROGRESSIVE",
+          "formatId": "hd",
+          "quality": "hd",
+          "protocol": "HTTP",
+          "container": "mp4",
+          "selector": {
+            "jsonPath": "$..videoDeliveryResponseResult.progressive_urls[?(@.metadata.quality=='HD')].progressive_url",
+            "fallbackJsonPath": "$..playable_url_quality_hd",
+            "fallbackRegex": "\"browser_native_hd_url\":\"([^\"]+)\""
+          },
+          "headers": {
+            "User-Agent": "facebookexternalhit/1.1"
+          },
+          "validation": {
+            "mustBeAbsoluteUrl": true,
+            "expectedScheme": "https"
+          }
+        },
+        {
+          "type": "PROGRESSIVE",
+          "formatId": "sd",
+          "quality": "sd",
+          "protocol": "HTTP",
+          "container": "mp4",
+          "selector": {
+            "jsonPath": "$..videoDeliveryResponseResult.progressive_urls[?(@.metadata.quality=='SD')].progressive_url",
+            "fallbackJsonPath": "$..playable_url",
+            "fallbackRegex": "\"browser_native_sd_url\":\"([^\"]+)\""
+          },
+          "headers": {
+            "User-Agent": "facebookexternalhit/1.1"
+          },
+          "validation": {
+            "mustBeAbsoluteUrl": true,
+            "expectedScheme": "https"
+          }
+        },
+        {
+          "type": "DASH",
+          "protocol": "DASH",
+          "container": "mp4",
+          "selector": {
+            "jsonPath": "$..videoDeliveryResponseResult.dash_manifest_urls[*].manifest_url",
+            "fallbackXmlStringJsonPath": "$..dash_manifest"
+          },
+          "headers": {
+            "User-Agent": "facebookexternalhit/1.1"
+          }
+        }
+      ],
+      "operationalNotes": [
+        "progressive_url / browser_native_*_url values are short-TTL signed CDN links -- resolve-then-fetch immediately, don't persist them.",
+        "The multi-layered jsonPath -> fallbackJsonPath -> fallbackRegex chain already present here is the right shape; keep extending it downward (regex last) rather than replacing earlier fallbacks when Facebook reshuffles its embedded JSON structure."
+      ],
+      "fallback": {
+        "useGenericFallback": true
+      }
+    },
+    {
+      "id": "twitter",
+      "platform": "Twitter/X",
+      "priority": 100,
+      "urlPatterns": [
+        "(?i)^https?://(?:(?:www|mobile|m)\\.)?(?:twitter|x)\\.com/(?:[^/]+/status|i/web/status)/(?<id>\\d+)",
+        "(?i)^https?://t\\.co/(?<tcoId>[^?#]+)"
+      ],
+      "pipeline": [
+        {
+          "step": "RESOLVE_SHORTENER",
+          "condition": "{{tcoId}} != null",
+          "request": {
+            "url": "https://t.co/{{tcoId}}",
+            "httpMethod": "HEAD",
+            "headers": {
+              "User-Agent": "curl/8.0.0"
+            },
+            "followRedirects": false
+          },
+          "extractVariables": {
+            "id": {
+              "source": "HEADER:Location",
+              "regex": "/status/(?<val>\\d+)",
+              "regexGroup": "val"
+            }
+          }
+        },
+        {
+          "step": "ACTIVATE_GUEST_TOKEN",
+          "request": {
+            "url": "https://api.x.com/1.1/guest/activate.json",
+            "httpMethod": "POST",
+            "headers": {
+              "Authorization": "Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA"
+            }
+          },
+          "extractVariables": {
+            "guestToken": "$.guest_token"
+          }
+        },
+        {
+          "step": "FETCH_TWEET_GRAPHQL",
+          "request": {
+            "url": "https://x.com/i/api/graphql/2ICDjqPd81tulZcYrtpTuQ/TweetResultByRestId?variables=%7B%22tweetId%22%3A%22{{id}}%22%2C%22withCommunity%22%3Afalse%2C%22includePromotedContent%22%3Afalse%2C%22withVoice%22%3Afalse%7D&features=%7B%22creator_subscriptions_tweet_preview_api_enabled%22%3Atrue%2C%22responsive_web_graphql_exclude_directive_enabled%22%3Atrue%7D&fieldToggles=%7B%22withArticleRichContentState%22%3Afalse%7D",
+            "httpMethod": "GET",
+            "headers": {
+              "Authorization": "Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA",
+              "x-guest-token": "{{guestToken}}"
+            }
+          }
+        }
+      ],
+      "contextRoot": "$..tweetResult.result.legacy",
+      "metadata": {
+        "title": {
+          "jsonPath": "$.full_text"
+        },
+        "description": {
+          "jsonPath": "$.full_text"
+        },
+        "duration": {
+          "jsonPath": "$.extended_entities.media[0].video_info.duration_millis",
+          "transform": "DIVIDE_1000",
+          "type": "FLOAT"
+        },
+        "uploader": {
+          "jsonPath": "$..core.user_results.result.legacy.name"
+        },
+        "uploaderId": {
+          "jsonPath": "$..core.user_results.result.legacy.screen_name"
+        },
+        "timestamp": {
+          "jsonPath": "$.created_at",
+          "type": "DATE_STRING"
+        },
+        "thumbnail": {
+          "jsonPath": "$.extended_entities.media[0].media_url_https"
+        },
+        "likeCount": {
+          "jsonPath": "$.favorite_count",
+          "type": "INTEGER"
+        },
+        "viewCount": {
+          "jsonPath": "$..views.count",
+          "type": "INTEGER"
+        }
+      },
+      "streams": [
+        {
+          "type": "PROGRESSIVE",
+          "protocol": "HTTP",
+          "container": "mp4",
+          "selector": {
+            "iterateArray": "$.extended_entities.media[*].video_info.variants",
+            "filter": "@.content_type == 'video/mp4'",
+            "urlPath": "$.url",
+            "bitratePath": "$.bitrate"
+          },
+          "transformations": [
+            {
+              "field": "width",
+              "source": "url",
+              "regex": "/(?<val>\\d+)x\\d+/",
+              "regexGroup": "val",
+              "type": "INTEGER"
+            },
+            {
+              "field": "height",
+              "source": "url",
+              "regex": "/\\d+x(?<val>\\d+)/",
+              "regexGroup": "val",
+              "type": "INTEGER"
+            }
+          ],
+          "validation": {
+            "mustBeAbsoluteUrl": true,
+            "expectedScheme": "https"
+          }
+        },
+        {
+          "type": "HLS",
+          "protocol": "HLS",
+          "container": "mp4",
+          "selector": {
+            "iterateArray": "$.extended_entities.media[*].video_info.variants",
+            "filter": "@.content_type == 'application/x-mpegURL'",
+            "urlPath": "$.url"
+          },
+          "validation": {
+            "mustBeAbsoluteUrl": true,
+            "expectedScheme": "https"
+          }
+        }
+      ],
+      "volatileFields": [
+        {
+          "path": "pipeline[2].request.url",
+          "field": "GraphQL operation id 2ICDjqPd81tulZcYrtpTuQ (TweetResultByRestId)",
+          "volatility": "high",
+          "refreshStrategy": "MANUAL_UPDATE_REQUIRED",
+          "note": "X rotates GraphQL operation ids on frontend deploys; a stale id typically returns HTTP 404 from the graphql endpoint, not a 401, which is easy to misdiagnose as an auth problem."
+        },
+        {
+          "path": "pipeline[1].request.headers.Authorization",
+          "field": "public guest bearer token",
+          "volatility": "low",
+          "refreshStrategy": "MANUAL_UPDATE_REQUIRED",
+          "note": "This is the widely-published static guest bearer used by logged-out web clients, not a per-user secret; it is still occasionally invalidated platform-wide."
+        }
+      ],
+      "fallback": {
+        "useGenericFallback": true
+      }
+    },
+    {
+      "id": "reddit",
+      "platform": "Reddit",
+      "priority": 100,
+      "urlPatterns": [
+        "(?i)^https?://(?:www\\.|old\\.)?reddit\\.com/r/(?<subreddit>[^/]+)/comments/(?<id>[a-z0-9]+)",
+        "(?i)^https?://redd\\.it/(?<id>[a-z0-9]+)",
+        "(?i)^https?://v\\.redd\\.it/(?<id>[a-z0-9]+)"
+      ],
+      "pipeline": [
+        {
+          "step": "FETCH_POST_JSON",
+          "request": {
+            "url": "https://www.reddit.com/comments/{{id}}.json?raw_json=1",
+            "httpMethod": "GET",
+            "headers": {
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+            }
+          }
+        }
+      ],
+      "contextRoot": "$[0].data.children[0].data",
+      "metadata": {
+        "title": {
+          "jsonPath": "$.title"
+        },
+        "description": {
+          "jsonPath": "$.selftext"
+        },
+        "duration": {
+          "jsonPath": "$.secure_media.reddit_video.duration",
+          "type": "INTEGER"
+        },
+        "uploader": {
+          "jsonPath": "$.author"
+        },
+        "channel": {
+          "jsonPath": "$.subreddit_name_prefixed"
+        },
+        "timestamp": {
+          "jsonPath": "$.created_utc",
+          "type": "INTEGER"
+        },
+        "thumbnail": {
+          "jsonPath": "$.thumbnail"
+        },
+        "likeCount": {
+          "jsonPath": "$.ups",
+          "type": "INTEGER"
+        },
+        "commentCount": {
+          "jsonPath": "$.num_comments",
+          "type": "INTEGER"
+        }
+      },
+      "streams": [
+        {
+          "type": "DASH",
+          "protocol": "DASH",
+          "container": "mp4",
+          "selector": {
+            "jsonPath": "$.secure_media.reddit_video.dash_url"
+          },
+          "validation": {
+            "mustBeAbsoluteUrl": true,
+            "expectedScheme": "https"
+          }
+        },
+        {
+          "type": "HLS",
+          "protocol": "HLS",
+          "container": "mp4",
+          "selector": {
+            "jsonPath": "$.secure_media.reddit_video.hls_url"
+          },
+          "validation": {
+            "mustBeAbsoluteUrl": true,
+            "expectedScheme": "https"
+          }
+        },
+        {
+          "type": "PROGRESSIVE",
+          "protocol": "HTTP",
+          "container": "mp4",
+          "selector": {
+            "jsonPath": "$.secure_media.reddit_video.fallback_url"
+          },
+          "transformations": [
+            {
+              "field": "height",
+              "jsonPath": "$.secure_media.reddit_video.height",
+              "type": "INTEGER"
+            },
+            {
+              "field": "width",
+              "jsonPath": "$.secure_media.reddit_video.width",
+              "type": "INTEGER"
+            },
+            {
+              "field": "bitrate",
+              "jsonPath": "$.secure_media.reddit_video.bitrate_kbps",
+              "transform": "MULTIPLY_1000",
+              "type": "INTEGER"
+            }
+          ],
+          "validation": {
+            "mustBeAbsoluteUrl": true,
+            "expectedScheme": "https"
+          }
+        }
+      ],
+      "operationalNotes": [
+        "Reddit's API rules require a descriptive, unique User-Agent (e.g. 'platform:app-id:version (by /u/handle)'); generic browser UAs on the unauthenticated .json endpoint get rate-limited (429) much sooner."
+      ],
+      "retryPolicy": {
+        "maxAttempts": 3,
+        "backoffMs": 1500,
+        "backoffMultiplier": 2.5
+      },
+      "fallback": {
+        "useGenericFallback": true
+      }
+    },
+    {
+      "id": "vimeo",
+      "platform": "Vimeo",
+      "priority": 100,
+      "urlPatterns": [
+        "(?i)^https?://(?:www\\.)?vimeo\\.com/(?<id>\\d+)",
+        "(?i)^https?://player\\.vimeo\\.com/video/(?<id>\\d+)"
+      ],
+      "pipeline": [
+        {
+          "step": "FETCH_CONFIG",
+          "request": {
+            "url": "https://player.vimeo.com/video/{{id}}/config",
+            "httpMethod": "GET",
+            "headers": {
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+              "Referer": "https://vimeo.com/"
+            }
+          }
+        }
+      ],
+      "metadata": {
+        "title": {
+          "jsonPath": "$.video.title"
+        },
+        "duration": {
+          "jsonPath": "$.video.duration",
+          "type": "INTEGER"
+        },
+        "uploader": {
+          "jsonPath": "$.video.owner.name"
+        },
+        "uploaderId": {
+          "jsonPath": "$.video.owner.id"
+        },
+        "channelUrl": {
+          "jsonPath": "$.video.owner.url"
+        },
+        "thumbnail": {
+          "jsonPath": "$.video.thumbs.base"
+        }
+      },
+      "streams": [
+        {
+          "type": "PROGRESSIVE",
+          "protocol": "HTTP",
+          "container": "mp4",
+          "selector": {
+            "iterateArray": "$.request.files.progressive",
+            "urlPath": "$.url",
+            "widthPath": "$.width",
+            "heightPath": "$.height",
+            "fpsPath": "$.fps",
+            "formatIdPath": "$.id"
+          },
+          "validation": {
+            "mustBeAbsoluteUrl": true,
+            "expectedScheme": "https"
+          }
+        },
+        {
+          "type": "HLS",
+          "protocol": "HLS",
+          "container": "mp4",
+          "selector": {
+            "jsonPath": "$.request.files.hls.cdns[0].url",
+            "fallbackJsonPath": "$.request.files.hls.default_cdn"
+          },
+          "validation": {
+            "mustBeAbsoluteUrl": true,
+            "expectedScheme": "https"
+          }
+        }
+      ],
+      "fallback": {
+        "useGenericFallback": true
+      }
+    },
+    {
+      "id": "pinterest",
+      "platform": "Pinterest",
+      "priority": 100,
+      "urlPatterns": [
+        "(?i)^https?://(?:[\\w-]+\\.)?pinterest\\.com/pin/(?<id>\\d+)",
+        "(?i)^https?://pin\\.it/(?<shortId>[a-zA-Z0-9]+)"
+      ],
+      "pipeline": [
+        {
+          "step": "RESOLVE_SHORTENER",
+          "condition": "{{shortId}} != null",
+          "request": {
+            "url": "https://pin.it/{{shortId}}",
+            "httpMethod": "HEAD",
+            "followRedirects": false
+          },
+          "extractVariables": {
+            "id": {
+              "source": "HEADER:Location",
+              "regex": "/pin/(?<val>\\d+)",
+              "regexGroup": "val"
+            }
+          }
+        },
+        {
+          "step": "FETCH_PIN_DETAILS",
+          "request": {
+            "url": "https://www.pinterest.com/resource/PinResource/get/?data=%7B%22options%22%3A%7B%22id%22%3A%22{{id}}%22%2C%22field_set_key%22%3A%22detailed%22%7D%7D",
+            "httpMethod": "GET",
+            "headers": {
+              "X-Requested-With": "XMLHttpRequest",
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+            }
+          }
+        }
+      ],
+      "contextRoot": "$.resource_response.data",
+      "metadata": {
+        "title": {
+          "jsonPath": "$.title",
+          "defaultValue": "Pinterest Video"
+        },
+        "description": {
+          "jsonPath": "$.description"
+        },
+        "uploader": {
+          "jsonPath": "$.pinner.username"
+        },
+        "uploaderId": {
+          "jsonPath": "$.pinner.id"
+        },
+        "thumbnail": {
+          "jsonPath": "$.images.orig.url"
+        },
+        "timestamp": {
+          "jsonPath": "$.created_at",
+          "type": "DATE_STRING"
+        }
+      },
+      "streams": [
+        {
+          "type": "PROGRESSIVE",
+          "protocol": "HTTP",
+          "container": "mp4",
+          "selector": {
+            "iterateMap": "$.videos.video_list",
+            "filter": "@.thumbnail != null && @.url =~ '\\.mp4'",
+            "urlPath": "$.url",
+            "widthPath": "$.width",
+            "heightPath": "$.height"
+          },
+          "validation": {
+            "mustBeAbsoluteUrl": true,
+            "expectedScheme": "https"
+          }
+        },
+        {
+          "type": "HLS",
+          "protocol": "HLS",
+          "container": "mp4",
+          "selector": {
+            "iterateMap": "$.videos.video_list",
+            "filter": "@.url =~ '\\.m3u8'",
+            "urlPath": "$.url"
+          },
+          "validation": {
+            "mustBeAbsoluteUrl": true,
+            "expectedScheme": "https"
+          }
+        }
+      ],
+      "operationalNotes": [
+        "The resource API generally expects a valid csrftoken/_auth cookie pair from a prior page load; requests without any cookie jar increasingly get stubbed/empty responses rather than clean errors."
+      ],
+      "fallback": {
+        "useGenericFallback": true
+      }
+    },
+    {
+      "id": "twitch",
+      "platform": "Twitch",
+      "priority": 100,
+      "urlPatterns": [
+        "(?i)^https?://(?:www\\.|clips\\.)?twitch\\.tv/(?:[^/]+/clip/|embed\\?clip=)?(?<clipId>[a-zA-Z0-9_-]+)(?:\\?.*)?$"
+      ],
+      "pipeline": [
+        {
+          "step": "QUERY_GQL_CLIP",
+          "request": {
+            "url": "https://gql.twitch.tv/gql",
+            "httpMethod": "POST",
+            "headers": {
+              "Client-ID": "kimne78kx3ncx6brgo4mv6wki5h1ko",
+              "Content-Type": "application/json"
+            },
+            "body": "[{\"operationName\":\"VideoAccessToken_Clip\",\"variables\":{\"slug\":\"{{clipId}}\"},\"extensions\":{\"persistedQuery\":{\"version\":1,\"sha256Hash\":\"36b89d2507fce29e5ca551df756d27c1cfe079e2609642b4390aa4cfffa1464e\"}}}]"
+          }
+        }
+      ],
+      "contextRoot": "$[0].data.clip",
+      "metadata": {
+        "title": {
+          "jsonPath": "$.title"
+        },
+        "duration": {
+          "jsonPath": "$.durationSeconds",
+          "type": "INTEGER"
+        },
+        "uploader": {
+          "jsonPath": "$.broadcaster.displayName"
+        },
+        "uploaderId": {
+          "jsonPath": "$.broadcaster.id"
+        },
+        "thumbnail": {
+          "jsonPath": "$.thumbnailURL"
+        },
+        "viewCount": {
+          "jsonPath": "$.viewCount",
+          "type": "INTEGER"
+        }
+      },
+      "streams": [
+        {
+          "type": "PROGRESSIVE",
+          "protocol": "HTTP",
+          "container": "mp4",
+          "selector": {
+            "iterateArray": "$.videoQualities",
+            "urlPath": "$.sourceURL",
+            "formatIdPath": "$.quality",
+            "fpsPath": "$.frameRate"
+          },
+          "transformations": [
+            {
+              "field": "height",
+              "source": "formatIdPath",
+              "regex": "(?<val>\\d+)",
+              "regexGroup": "val",
+              "type": "INTEGER"
+            }
+          ],
+          "validation": {
+            "mustBeAbsoluteUrl": true,
+            "expectedScheme": "https"
+          }
+        }
+      ],
+      "volatileFields": [
+        {
+          "path": "pipeline[0].request.body",
+          "field": "persistedQuery.sha256Hash for VideoAccessToken_Clip",
+          "volatility": "medium",
+          "refreshStrategy": "MANUAL_UPDATE_REQUIRED",
+          "note": "Twitch invalidates old persisted-query hashes when it ships GQL client updates; a stale hash returns a PersistedQueryNotFound error, not a data payload."
+        }
+      ],
+      "fallback": {
+        "useGenericFallback": true
+      }
+    },
+    {
+      "id": "threads",
+      "platform": "Threads",
+      "priority": 100,
+      "urlPatterns": [
+        "(?i)^https?://(?:www\\.)?threads\\.net/(?:@(?<username>[\\w.-]+)/)?post/(?<id>[a-zA-Z0-9_-]+)"
+      ],
+      "transformations": [
+        {
+          "variable": "mediaId",
+          "source": "id",
+          "type": "BASE64_CUSTOM_DECODE",
+          "alphabet": "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+        }
+      ],
+      "pipeline": [
+        {
+          "step": "FETCH_POST_GRAPHQL",
+          "request": {
+            "url": "https://www.threads.net/api/graphql",
+            "httpMethod": "POST",
+            "headers": {
+              "X-IG-App-ID": "238260118697367",
+              "Content-Type": "application/x-www-form-urlencoded",
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+            },
+            "body": "variables=%7B%22postID%22%3A%22{{mediaId}}%22%7D&doc_id=7410046645719363"
+          }
+        }
+      ],
+      "contextRoot": "$..data.data.containing_thread.thread_items[0].post",
+      "metadata": {
+        "title": {
+          "jsonPath": "$.caption.text",
+          "defaultValue": "Threads Video"
+        },
+        "uploader": {
+          "jsonPath": "$.user.username"
+        },
+        "uploaderId": {
+          "jsonPath": "$.user.pk"
+        },
+        "timestamp": {
+          "jsonPath": "$.taken_at",
+          "type": "INTEGER"
+        },
+        "likeCount": {
+          "jsonPath": "$.like_count",
+          "type": "INTEGER"
+        },
+        "thumbnail": {
+          "jsonPath": "$.image_versions2.candidates[0].url"
+        }
+      },
+      "streams": [
+        {
+          "type": "PROGRESSIVE",
+          "protocol": "HTTP",
+          "container": "mp4",
+          "selector": {
+            "iterateArray": "$.video_versions",
+            "urlPath": "$.url",
+            "widthPath": "$.width",
+            "heightPath": "$.height",
+            "formatIdPath": "$.id"
+          },
+          "headers": {
+            "Referer": "https://www.threads.net/"
+          },
+          "validation": {
+            "mustBeAbsoluteUrl": true,
+            "expectedScheme": "https"
+          }
+        }
+      ],
+      "volatileFields": [
+        {
+          "path": "pipeline[0].request.body",
+          "field": "doc_id=7410046645719363",
+          "volatility": "high",
+          "refreshStrategy": "MANUAL_UPDATE_REQUIRED",
+          "note": "Same rotation behavior as Instagram's doc_id -- Threads shares Meta's GraphQL infrastructure."
+        }
+      ],
+      "fallback": {
+        "useGenericFallback": true
+      }
+    },
+    {
+      "id": "dailymotion",
+      "platform": "Dailymotion",
+      "priority": 100,
+      "urlPatterns": [
+        "(?i)^https?://(?:www\\.|geo\\.|touch\\.)?dailymotion\\.com/(?:video|embed/video|crawler/video)/(?<id>[a-zA-Z0-9]+)",
+        "(?i)^https?://dai\\.ly/(?<id>[a-zA-Z0-9]+)",
+        "(?i)^https?://geo\\.dailymotion\\.com/player(?:/[a-zA-Z0-9]+)?\\.html\\?video=(?<id>[a-zA-Z0-9]+)"
+      ],
+      "pipeline": [
+        {
+          "step": "AUTHENTICATE",
+          "request": {
+            "url": "https://graphql.api.dailymotion.com/oauth/token",
+            "httpMethod": "POST",
+            "headers": {
+              "Content-Type": "application/x-www-form-urlencoded"
+            },
+            "body": "grant_type=client_credentials&client_id=f1a362d288c1b98099c7&client_secret=eea605b96e01c796ff369935357eca920c5da4c5"
+          },
+          "extractVariables": {
+            "token": "$.access_token"
+          }
+        },
+        {
+          "step": "FETCH_CANONICAL_ID",
+          "request": {
+            "url": "https://graphql.api.dailymotion.com/",
+            "httpMethod": "POST",
+            "headers": {
+              "Content-Type": "application/json",
+              "Authorization": "Bearer {{token}}"
+            },
+            "body": "{\"query\":\"{ media(xid: \\\"{{id}}\\\") { ... on Video { xid description stats { likes { total } views { total } } } ... on Live { xid audienceCount isOnAir } } }\"}"
+          },
+          "extractVariables": {
+            "xid": "$.data.media.xid",
+            "likes": "$.data.media.stats.likes.total",
+            "views": "$.data.media.stats.views.total",
+            "description": "$.data.media.description"
+          }
+        },
+        {
+          "step": "FETCH_PLAYER_METADATA",
+          "request": {
+            "url": "https://www.dailymotion.com/player/metadata/video/{{xid}}?app=com.dailymotion.neon",
+            "httpMethod": "GET",
+            "headers": {
+              "Accept": "application/json",
+              "Origin": "https://www.dailymotion.com"
+            }
+          }
+        }
+      ],
+      "metadata": {
+        "title": {
+          "jsonPath": "$.title"
+        },
+        "description": {
+          "variable": "description"
+        },
+        "duration": {
+          "jsonPath": "$.duration",
+          "type": "INTEGER"
+        },
+        "uploader": {
+          "jsonPath": "$.owner.screenname"
+        },
+        "uploaderId": {
+          "jsonPath": "$.owner.id"
+        },
+        "timestamp": {
+          "jsonPath": "$.created_time",
+          "type": "INTEGER"
+        },
+        "thumbnail": {
+          "jsonPath": "$.posters.1080",
+          "fallbackJsonPath": "$.posters.720"
+        },
+        "viewCount": {
+          "variable": "views",
+          "type": "INTEGER"
+        },
+        "likeCount": {
+          "variable": "likes",
+          "type": "INTEGER"
+        }
+      },
+      "streams": [
+        {
+          "type": "HLS",
+          "protocol": "HLS",
+          "container": "mp4",
+          "selector": {
+            "jsonPath": "$.qualities.auto[*].url"
+          },
+          "validation": {
+            "mustBeAbsoluteUrl": true,
+            "expectedScheme": "https"
+          }
+        },
+        {
+          "type": "PROGRESSIVE",
+          "protocol": "HTTP",
+          "container": "mp4",
+          "selector": {
+            "iterateMap": "$.qualities",
+            "filter": "@.type == 'video/mp4'",
+            "urlPath": "$.url"
+          },
+          "transformations": [
+            {
+              "field": "height",
+              "regex": "/H264-\\d+x(?<val>\\d+)",
+              "type": "INTEGER"
+            },
+            {
+              "field": "width",
+              "regex": "/H264-(?<val>\\d+)x\\d+",
+              "type": "INTEGER"
+            },
+            {
+              "field": "fps",
+              "regex": "/H264-\\d+x\\d+-(?<val>60)/",
+              "defaultValue": 30,
+              "type": "INTEGER"
+            }
+          ],
+          "validation": {
+            "mustBeAbsoluteUrl": true,
+            "expectedScheme": "https"
+          }
+        }
+      ],
+      "volatileFields": [
+        {
+          "path": "pipeline[0].request.body",
+          "field": "client_id/client_secret",
+          "volatility": "low",
+          "refreshStrategy": "MANUAL_UPDATE_REQUIRED",
+          "note": "This public client_credentials pair embedded in Dailymotion's own web player has been stable for years, but confirm it first if AUTHENTICATE starts failing."
+        }
+      ],
+      "fallback": {
+        "useGenericFallback": true
+      }
+    },
+    {
+      "id": "rumble",
+      "platform": "Rumble",
+      "priority": 100,
+      "urlPatterns": [
+        "(?i)^https?://(?:www\\.)?rumble\\.com/(?<pageId>v(?!ideos)[\\w.-]+)[^/]*$",
+        "(?i)^https?://(?:www\\.)?rumble\\.com/embed/(?:[0-9a-z]+\\.)?(?<embedId>[0-9a-z]+)"
+      ],
+      "pipeline": [
+        {
+          "step": "RESOLVE_EMBED_ID",
+          "condition": "{{embedId}} == null",
+          "request": {
+            "url": "https://rumble.com/{{pageId}}.html",
+            "httpMethod": "GET",
+            "headers": {
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+            }
+          },
+          "extractVariables": {
+            "embedId": {
+              "regex": "<script>[^<]*\\bRumble\\(\\s*\"play\"\\s*,\\s*\\{[^}]*video[\"']?\\s*:\\s*[\"'](?<val>[0-9a-z]+)[\"']",
+              "regexGroup": "val",
+              "fallbackRegex": "\"embedUrl\"\\s*:\\s*\"https?://(?:www\\.)?rumble\\.com/embed/(?<val>[0-9a-z]+)"
+            }
+          }
+        },
+        {
+          "step": "FETCH_VIDEO_METADATA",
+          "request": {
+            "url": "https://rumble.com/embedJS/u3/?request=video&ver=2&v={{embedId}}",
+            "httpMethod": "GET",
+            "headers": {
+              "Accept": "application/json"
+            }
+          }
+        }
+      ],
+      "metadata": {
+        "title": {
+          "jsonPath": "$.title"
+        },
+        "duration": {
+          "jsonPath": "$.duration",
+          "type": "INTEGER"
+        },
+        "uploader": {
+          "jsonPath": "$.author.name"
+        },
+        "channelUrl": {
+          "jsonPath": "$.author.url"
+        },
+        "timestamp": {
+          "jsonPath": "$.pubDate",
+          "type": "ISO8601"
+        },
+        "thumbnail": {
+          "jsonPath": "$.i",
+          "fallbackJsonPath": "$.t[0].i"
+        }
+      },
+      "streams": [
+        {
+          "type": "PROGRESSIVE",
+          "protocol": "HTTP",
+          "container": "mp4",
+          "selector": {
+            "iterateMap": "$.ua.mp4",
+            "urlPath": "$.url",
+            "widthPath": "$.meta.w",
+            "heightPath": "$.meta.h",
+            "bitratePath": "$.meta.bitrate",
+            "filesizePath": "$.meta.size"
+          },
+          "validation": {
+            "mustBeAbsoluteUrl": true,
+            "expectedScheme": "https"
+          }
+        },
+        {
+          "type": "HLS",
+          "protocol": "HLS",
+          "container": "mp4",
+          "selector": {
+            "iterateArray": "$.ua.hls",
+            "urlPath": "$.url"
+          },
+          "validation": {
+            "mustBeAbsoluteUrl": true,
+            "expectedScheme": "https"
+          }
+        }
+      ],
+      "operationalNotes": [
+        "RESOLVE_EMBED_ID depends on inline page JS structure rather than a stable API, so it's the most likely step to need a regex update after a Rumble frontend change."
+      ],
+      "fallback": {
+        "useGenericFallback": true
+      }
+    }
+  ],
+  "changelog": [
+    {
+      "version": 4,
+      "date": 1791801361711,
+      "changes": [
+        "Added globalDefaults.retryPolicy: standardized retry/backoff for transient failures (429/403/empty body/JSON parse errors), modeled on yt-dlp's RetryManager pattern.",
+        "Added globalDefaults.genericFallback: last-resort Open Graph / meta-tag scraping used when a platform-specific pipeline step fails outright (mirrors yt-dlp's 'generic' extractor as an ultimate fallback).",
+        "Added per-rule 'volatileFields': flags hardcoded doc_id/queryId/hash values that platforms rotate periodically, with a refreshStrategy hint, so breakage can be triaged quickly instead of silently failing.",
+        "Added per-rule 'operationalNotes' capturing known fragility points (rate limits, URL TTL, anti-bot requirements) observed in the wild.",
+        "Did not add device-fingerprinted private mobile-app API bypasses (e.g. TikTok's internal aweme API) or any DRM/anti-bot circumvention logic; that class of technique is deliberately out of scope here."
+      ]
+    }
+  ],
+  "globalDefaults": {
+    "retryPolicy": {
+      "maxAttempts": 3,
+      "backoffMs": 800,
+      "backoffMultiplier": 2.0,
+      "retryOn": [
+        "HTTP_429",
+        "HTTP_403",
+        "HTTP_5XX",
+        "JSON_PARSE_ERROR",
+        "EMPTY_RESPONSE",
+        "TIMEOUT"
+      ],
+      "note": "Applies to every pipeline request unless a rule defines its own retryPolicy override."
+    },
+    "genericFallback": {
+      "enabled": true,
+      "description": "Invoked only when every step of a rule's own pipeline (including its retries) has failed, e.g. because a volatile token/hash rotated. Extracts whatever a plain Open Graph scrape of the original URL can give: title, description, a direct video URL if one is exposed in og:video, and a thumbnail. This will not recover watermark-free or multi-bitrate streams -- it is a degrade-gracefully path, not a replacement for the platform-specific pipeline.",
+      "steps": [
+        {
+          "step": "FETCH_OG_META",
+          "request": {
+            "url": "{{originalUrl}}",
+            "httpMethod": "GET",
+            "headers": {
+              "User-Agent": "Mozilla/5.0 (compatible; facebookexternalhit/1.1)",
+              "Accept-Language": "en-US,en;q=0.9"
+            }
+          },
+          "extractVariables": {
+            "ogTitle": {
+              "regex": "<meta\\s+property=\"og:title\"\\s+content=\"(?<val>[^\"]+)\"",
+              "regexGroup": "val"
+            },
+            "ogDescription": {
+              "regex": "<meta\\s+property=\"og:description\"\\s+content=\"(?<val>[^\"]+)\"",
+              "regexGroup": "val"
+            },
+            "ogVideoUrl": {
+              "regex": "<meta\\s+property=\"og:video(?::secure_url)?\"\\s+content=\"(?<val>[^\"]+)\"",
+              "regexGroup": "val"
+            },
+            "ogImage": {
+              "regex": "<meta\\s+property=\"og:image\"\\s+content=\"(?<val>[^\"]+)\"",
+              "regexGroup": "val"
+            }
+          }
+        }
+      ]
+    }
+  }
+}
