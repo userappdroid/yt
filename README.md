@@ -358,6 +358,417 @@ In `StreamFailoverEngine.registerCandidates`:
 
 - **Limitations preventing full verification**:
   - No Gradle compiler/emulator or live M3U/Xtream provider endpoints are accessible in this environment, so runtime compilation, HTTP redirect integration, and live playback against real IPTV servers remain unexecuted here.
+ 
+
 
 Ready to proceed to **Phase 2: Playlist and catalog integrity** when you say **start phase 2**.
+
+
+
+
+## Phase 2: Playlist and Catalog Integrity
+
+### 1. Inspection Findings (from the uploaded source)
+Reviewing the Phase 2 synchronization, channel identity, duplicate cleanup, override preservation, and partial-import protection paths across `PlaylistRepository`, `UnifiedCatalogRepository`, `PlaylistSyncEngine`, `ResilientSyncPolicy`, `PlaylistFingerprint`, `DuplicateCleanupRepository`, `DuplicateDetectionEngine`, `ChannelDao`, `ChannelOrganizationRepository`, and `AppLifecycleSupervisor` surfaced the following concrete defects:
+
+1. **Legacy `PlaylistRepository.syncPlaylist` Uses Incompatible Identity & Bypasses Partial/Shrinkage Guards (`data/repository/PlaylistRepository.kt`)**:
+   - `syncPlaylist` still called `M3uParser.parse(...)` instead of `M3uParser.parseExtended(...)`, omitting `channelNumber`, `tvgName`, `catchupDays`, `catchupSource`, `CategoryNormalizer`, and `ChannelNameNormalizer`.
+   - Computing `PlaylistFingerprint.computeIdentity` with raw `event.channel.title` instead of `ChannelNameNormalizer.normalize(vu.title)` caused `channelIdentity` mismatches against `UrlViewModel` and `M3uIptvProvider`, breaking user overrides (`ChannelUserOverrideEntity`) and favorites (`live_identity:...`) if a playlist was synced via `PlaylistRepository`.
+   - `syncPlaylist` ignored `ParseEvent.Done(total, truncated)` (allowing truncated playlists to destructively delete remaining channels), ignored `ResilientSyncPolicy.EvaluationResult.RequiresUserApproval` (allowing 0-channel or >50%-shrinkage feeds to wipe the catalog), and did not use `NonCancellable` on `CancellationException` when resetting `SyncState.SYNCING`.
+2. **VOD / Series Catalogs Unprotected Against Empty/Partial Provider Responses (`data/repository/UnifiedCatalogRepository.kt`)**:
+   - `UnifiedCatalogRepository.syncProviderCatalog` evaluated `ResilientSyncPolicy.evaluateBatchSafety` only on Live channels. If an Xtream server returned an empty or truncated `get_vod_streams` or `get_series` response (HTTP 200 `[]`) while Live channels succeeded, `reconcileMoviesNonDestructively` / `reconcileSeriesNonDestructively` would delete existing VOD movies or series and their watch progress.
+   - Additionally, `incomingMovies` and `incomingSeries` were not deduplicated by `streamId`/`seriesId` before reconciliation.
+3. **Channel Overrides Ignored by `countAll()`, `getFavorites()`, and `getRecentlyPlayed()` (`data/dao/ChannelDao.kt`)**:
+   - `ChannelDao.countAll()` counted hidden channels (`cuo.isHidden = 1`), causing UI channel counts (`UrlListFragment`, category drawer) to disagree with the visible list.
+   - `ChannelDao.getFavorites()` and `ChannelDao.getRecentlyPlayed()` did not join `channel_user_overrides`, allowing hidden channels to appear in Favorites/Recents and ignoring custom titles, logos, groups, and channel numbers.
+4. **Duplicate Merge Did Not Migrate `UnifiedFavoriteEntity` Ledger (`data/repository/DuplicateCleanupRepository.kt`)**:
+   - `DuplicateAction.MERGE_ENDPOINTS` only toggled `channelDao.setFavorite(primaryChannelId, true)` without migrating the favorite in `UnifiedFavoriteDao`. Because `ProfileFavoriteSynchronizer` treats `channels.isFavorite` as a projection of `unified_favorites`, the merged favorite would be wiped on the next profile switch or favorite toggle, and a dangling `live_identity:<deleted>` row remained.
+
+---
+
+### 2. Required Fixes
+
+#### `data/repository/PlaylistRepository.kt`
+Update imports to include `kotlinx.coroutines.NonCancellable`, `kotlinx.coroutines.withContext`, `vid.mat.app.provider.normalization.CategoryNormalizer`, and `vid.mat.app.provider.normalization.ChannelNameNormalizer`, and replace `syncPlaylist`:
+```kotlin
+    suspend fun syncPlaylist(
+        context: Context,
+        sourceId: Long,
+        forceSync: Boolean = false,
+        onProgress: ((processed: Int, total: Int) -> Unit)? = null
+    ): Result<Int> {
+        val source = sourceDao.getById(sourceId)
+            ?: return Result.failure(IllegalArgumentException("Playlist source with ID $sourceId not found"))
+
+        if (source.sourceUrl.isBlank()) {
+            return Result.failure(IllegalStateException("No source URL configured for source $sourceId"))
+        }
+
+        sourceDao.updateSyncState(sourceId, SyncState.SYNCING, null)
+
+        return try {
+            AppLogger.i(TAG, "Starting sync for playlist source ${source.name} (ID: $sourceId)")
+            val syncItems = mutableListOf<PlaylistSyncEngine.SyncItem>()
+            var wasTruncated = false
+
+            M3uParser.parseExtended(context, source.sourceUrl, httpClient).collect { event ->
+                when (event) {
+                    is M3uParser.ExtendedParseEvent.Channel -> {
+                        val entry = event.entry
+                        val vu = entry.channel
+                        val canonicalTitle = ChannelNameNormalizer.normalize(vu.title).ifBlank { vu.title }
+                        val unifiedGroup = CategoryNormalizer.normalize(vu.groupTitle)
+                        val identity = PlaylistFingerprint.computeIdentity(
+                            sourceId = sourceId,
+                            externalId = vu.tvgId,
+                            tvgId = vu.tvgId,
+                            title = canonicalTitle
+                        )
+
+                        val channel = Channel(
+                            sourceId = sourceId,
+                            channelIdentity = identity,
+                            externalId = vu.tvgId,
+                            channelNumber = entry.channelNumber ?: (syncItems.size + 1),
+                            title = vu.title,
+                            logoUrl = vu.logoUrl,
+                            groupTitle = unifiedGroup,
+                            tvgId = vu.tvgId,
+                            tvgName = entry.tvgName ?: vu.tvgId,
+                            catchupDays = entry.catchupDays,
+                            catchupSource = entry.catchupSource,
+                            userOrder = syncItems.size
+                        )
+
+                        val path = vu.url.substringBefore('?').substringBefore('#').lowercase()
+                        val inferredFormat = when {
+                            path.endsWith(".m3u8") -> "m3u8"
+                            path.endsWith(".mpd") -> "mpd"
+                            path.endsWith(".mp4") || path.endsWith(".m4v") || path.endsWith(".mov") -> "mp4"
+                            path.endsWith(".mkv") -> "mkv"
+                            path.endsWith(".ts") || path.endsWith(".m2ts") -> "ts"
+                            else -> "auto"
+                        }
+
+                        val endpoint = StreamEndpoint(
+                            channelId = 0L,
+                            url = vu.url,
+                            priority = 0,
+                            containerFormat = inferredFormat,
+                            resolutionLabel = vu.resolution ?: "Auto",
+                            userAgent = vu.userAgent,
+                            referer = vu.referer,
+                            cookie = vu.cookie,
+                            authorization = vu.authorization
+                        )
+
+                        syncItems.add(PlaylistSyncEngine.SyncItem(channel, listOf(endpoint)))
+                    }
+                    is M3uParser.ExtendedParseEvent.Done -> wasTruncated = event.truncated
+                    is M3uParser.ExtendedParseEvent.Error -> {
+                        throw IllegalStateException(event.message, event.cause)
+                    }
+                    else -> Unit
+                }
+            }
+
+            if (wasTruncated) {
+                val reason = "Playlist exceeded maximum supported capacity and was truncated; aborting sync to preserve existing catalog."
+                sourceDao.updateSyncState(sourceId, SyncState.FAILED, reason)
+                return Result.failure(IllegalStateException(reason))
+            }
+
+            val existingCount = channelDao.countForSource(sourceId)
+            val safetyCheck = ResilientSyncPolicy.evaluateBatchSafety(
+                incomingCount = syncItems.size,
+                existingCount = existingCount,
+                sourceName = source.name,
+                forceSync = forceSync
+            )
+
+            when (safetyCheck) {
+                is ResilientSyncPolicy.EvaluationResult.Rejected -> {
+                    sourceDao.updateSyncState(sourceId, SyncState.FAILED, safetyCheck.reason)
+                    return Result.failure(IllegalStateException(safetyCheck.reason))
+                }
+                is ResilientSyncPolicy.EvaluationResult.RequiresUserApproval -> {
+                    sourceDao.updateSyncState(sourceId, SyncState.FAILED, "Pending User Approval")
+                    return Result.failure(SyncRequiresApprovalException(safetyCheck.reason, sourceId))
+                }
+                ResilientSyncPolicy.EvaluationResult.Accepted -> Unit
+            }
+
+            val syncResult = syncEngine.syncSource(
+                sourceId = sourceId,
+                incomingItems = syncItems,
+                onProgress = onProgress
+            )
+
+            AppLogger.i(TAG, "Playlist sync successful for source $sourceId. Processed: ${syncResult.totalProcessed}")
+            Result.success(syncResult.totalProcessed)
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            withContext(NonCancellable) {
+                runCatching { sourceDao.updateSyncState(sourceId, SyncState.FAILED, "Sync cancelled") }
+            }
+            throw e
+        } catch (e: Exception) {
+            AppLogger.e(TAG, "Failed syncing playlist $sourceId — preserving last known good catalog", e)
+            sourceDao.updateSyncState(sourceId, SyncState.FAILED, e.message)
+            Result.failure(e)
+        }
+    }
+```
+
+#### `data/repository/UnifiedCatalogRepository.kt`
+In `syncProviderCatalog`, evaluate `ResilientSyncPolicy` for fetched VOD/Series catalogs as well, and deduplicate by `streamId`/`seriesId` before reconciling:
+```kotlin
+        if (catalog.isMoviesFetched) {
+            val existingMovieCount = vodMovieDao.getAllForSource(sourceId).size
+            when (val vodSafety = ResilientSyncPolicy.evaluateBatchSafety(
+                incomingCount = catalog.movies.size,
+                existingCount = existingMovieCount,
+                sourceName = "${source.name} (VOD)",
+                forceSync = forceSync
+            )) {
+                is ResilientSyncPolicy.EvaluationResult.Rejected -> {
+                    sourceDao.updateSyncState(sourceId, SyncState.FAILED, vodSafety.reason)
+                    return@withContext Result.failure(IllegalStateException(vodSafety.reason))
+                }
+                is ResilientSyncPolicy.EvaluationResult.RequiresUserApproval -> {
+                    sourceDao.updateSyncState(sourceId, SyncState.FAILED, "Pending User Approval")
+                    return@withContext Result.failure(SyncRequiresApprovalException(vodSafety.reason, sourceId))
+                }
+                ResilientSyncPolicy.EvaluationResult.Accepted -> Unit
+            }
+        }
+
+        if (catalog.isSeriesFetched) {
+            val existingSeriesCount = seriesDao.getAllForSource(sourceId).size
+            when (val seriesSafety = ResilientSyncPolicy.evaluateBatchSafety(
+                incomingCount = catalog.series.size,
+                existingCount = existingSeriesCount,
+                sourceName = "${source.name} (Series)",
+                forceSync = forceSync
+            )) {
+                is ResilientSyncPolicy.EvaluationResult.Rejected -> {
+                    sourceDao.updateSyncState(sourceId, SyncState.FAILED, seriesSafety.reason)
+                    return@withContext Result.failure(IllegalStateException(seriesSafety.reason))
+                }
+                is ResilientSyncPolicy.EvaluationResult.RequiresUserApproval -> {
+                    sourceDao.updateSyncState(sourceId, SyncState.FAILED, "Pending User Approval")
+                    return@withContext Result.failure(SyncRequiresApprovalException(seriesSafety.reason, sourceId))
+                }
+                ResilientSyncPolicy.EvaluationResult.Accepted -> Unit
+            }
+        }
+```
+And in `reconcileMoviesNonDestructively` / `reconcileSeriesNonDestructively`, deduplicate incoming items:
+```kotlin
+    private suspend fun reconcileMoviesNonDestructively(sourceId: Long, incomingMovies: List<NormalizedVodMovie>) {
+        val uniqueIncoming = incomingMovies.distinctBy { it.streamId }
+        val existingByStreamId = vodMovieDao.getAllForSource(sourceId).associateBy { it.streamId }
+        val incomingStreamIds = uniqueIncoming.map { it.streamId }.toSet()
+        // ... iterate uniqueIncoming ...
+```
+```kotlin
+    private suspend fun reconcileSeriesNonDestructively(sourceId: Long, incomingSeries: List<NormalizedSeries>) {
+        val uniqueIncoming = incomingSeries.distinctBy { it.seriesId }
+        val existingBySeriesId = seriesDao.getAllForSource(sourceId).associateBy { it.seriesId }
+        val incomingSeriesIds = uniqueIncoming.map { it.seriesId }.toSet()
+        // ... iterate uniqueIncoming ...
+```
+
+#### `data/dao/ChannelDao.kt`
+Update `getFavorites()`, `getRecentlyPlayed()`, and `countAll()` to respect `channel_user_overrides`:
+```kotlin
+    @Query("""
+        SELECT c.channelId, c.sourceId, c.channelIdentity, c.externalId,
+               COALESCE(cuo.customChannelNumber, c.channelNumber) AS channelNumber,
+               COALESCE(NULLIF(cuo.customTitle, ''), c.title) AS title,
+               COALESCE(NULLIF(cuo.customLogoUrl, ''), c.logoUrl) AS logoUrl,
+               COALESCE(NULLIF(cuo.customGroupTitle, ''), c.groupTitle) AS groupTitle,
+               c.tvgId, c.tvgName, c.isFavorite,
+               COALESCE(cuo.userOrderIndex, c.userOrder) AS userOrder,
+               c.catchupDays, c.catchupSource, c.lastPlayedAtMs, c.createdAtMs, c.updatedAtMs
+        FROM channels c
+        LEFT JOIN channel_user_overrides cuo ON c.channelIdentity = cuo.channelIdentity
+        WHERE COALESCE(cuo.isHidden, 0) = 0 AND c.isFavorite = 1
+        ORDER BY COALESCE(cuo.userOrderIndex, c.userOrder) ASC, title ASC
+        LIMIT 50
+    """)
+    fun getFavorites(): Flow<List<Channel>>
+
+    @Query("""
+        SELECT c.channelId, c.sourceId, c.channelIdentity, c.externalId,
+               COALESCE(cuo.customChannelNumber, c.channelNumber) AS channelNumber,
+               COALESCE(NULLIF(cuo.customTitle, ''), c.title) AS title,
+               COALESCE(NULLIF(cuo.customLogoUrl, ''), c.logoUrl) AS logoUrl,
+               COALESCE(NULLIF(cuo.customGroupTitle, ''), c.groupTitle) AS groupTitle,
+               c.tvgId, c.tvgName, c.isFavorite,
+               COALESCE(cuo.userOrderIndex, c.userOrder) AS userOrder,
+               c.catchupDays, c.catchupSource, c.lastPlayedAtMs, c.createdAtMs, c.updatedAtMs
+        FROM channels c
+        LEFT JOIN channel_user_overrides cuo ON c.channelIdentity = cuo.channelIdentity
+        WHERE COALESCE(cuo.isHidden, 0) = 0 AND c.lastPlayedAtMs IS NOT NULL
+        ORDER BY c.lastPlayedAtMs DESC
+        LIMIT 20
+    """)
+    fun getRecentlyPlayed(): Flow<List<Channel>>
+
+    @Query("""
+        SELECT COUNT(*) FROM channels c
+        LEFT JOIN channel_user_overrides cuo ON c.channelIdentity = cuo.channelIdentity
+        WHERE COALESCE(cuo.isHidden, 0) = 0
+    """)
+    fun countAll(): Flow<Int>
+```
+*(Keep `countForSource(sourceId: Long)` unchanged so raw source counts for `ResilientSyncPolicy` remain accurate.)*
+
+#### `data/repository/DuplicateCleanupRepository.kt`
+Inject `UnifiedFavoriteDao` and `ActiveProfileProvider`, and migrate/clean up `unified_favorites` entries when merging or deleting duplicate channels:
+```kotlin
+@Singleton
+class DuplicateCleanupRepository @Inject constructor(
+    @ApplicationContext private val context: Context,
+    private val database: VideoUrlDatabase,
+    private val channelDao: ChannelDao,
+    private val endpointDao: StreamEndpointDao,
+    private val overrideDao: ChannelUserOverrideDao,
+    private val favoriteDao: UnifiedFavoriteDao,
+    private val activeProfileProvider: ActiveProfileProvider,
+    private val engine: DuplicateDetectionEngine
+) {
+```
+Inside `resolveGroup`:
+```kotlin
+    suspend fun resolveGroup(group: DuplicateChannelGroup, action: DuplicateAction) = withContext(Dispatchers.IO) {
+        val activeProfileId = activeProfileProvider.awaitInitializedProfile().id
+        database.withTransaction {
+            when (action) {
+                DuplicateAction.MERGE_ENDPOINTS -> {
+                    AppLogger.i(TAG, "Merging endpoints for '${group.bestCandidate.channel.title}'")
+                    val primaryChannel = group.bestCandidate.channel
+                    val primaryChannelId = primaryChannel.channelId
+                    val existingUrls = group.bestCandidate.endpoints.map { it.url }.toHashSet()
+                    val lowestPrimaryPriority = group.bestCandidate.endpoints.minOfOrNull { it.priority } ?: 0
+
+                    val allEndpointsToAttach = group.duplicates
+                        .flatMap { it.endpoints }
+                        .distinctBy { it.url }
+                        .filterNot { it.url in existingUrls }
+                        .mapIndexed { idx, ep ->
+                            ep.copy(
+                                endpointId = 0L,
+                                channelId = primaryChannelId,
+                                priority = lowestPrimaryPriority - 1 - idx
+                            )
+                        }
+
+                    if (allEndpointsToAttach.isNotEmpty()) {
+                        endpointDao.insertBatch(allEndpointsToAttach)
+                    }
+
+                    val primaryFavTarget = FavoriteTargetIds.live(primaryChannel.channelIdentity)
+                    var primaryIsFav = primaryChannel.isFavorite ||
+                        favoriteDao.isFavorite(primaryFavTarget, activeProfileId)
+
+                    group.duplicates.forEach { dup ->
+                        val dupFavTarget = FavoriteTargetIds.live(dup.channel.channelIdentity)
+                        if (dup.channel.isFavorite || favoriteDao.isFavorite(dupFavTarget, activeProfileId)) {
+                            if (!primaryIsFav) {
+                                favoriteDao.upsert(
+                                    UnifiedFavoriteEntity(
+                                        targetId = primaryFavTarget,
+                                        profileId = activeProfileId,
+                                        type = FavoriteType.LIVE_CHANNEL,
+                                        title = primaryChannel.title,
+                                        subtitle = primaryChannel.tvgName,
+                                        logoUrl = primaryChannel.logoUrl,
+                                        streamUrl = group.bestCandidate.endpoints.firstOrNull()?.url.orEmpty(),
+                                        groupTitle = primaryChannel.groupTitle
+                                    )
+                                )
+                                channelDao.setFavorite(primaryChannelId, true)
+                                primaryIsFav = true
+                            }
+                            favoriteDao.deleteByTarget(dupFavTarget, activeProfileId)
+                        }
+                        overrideDao.deleteByIdentity(dup.channel.channelIdentity)
+                        channelDao.delete(dup.channel)
+                    }
+                }
+
+                DuplicateAction.HIDE_DUPLICATES -> {
+                    AppLogger.i(TAG, "Hiding duplicate channels for '${group.bestCandidate.channel.title}'")
+                    val now = System.currentTimeMillis()
+                    group.duplicates.forEach { dup ->
+                        val existing = overrideDao.getByIdentity(dup.channel.channelIdentity)
+                        val updated = (existing ?: ChannelUserOverrideEntity(
+                            channelIdentity = dup.channel.channelIdentity
+                        )).copy(
+                            isHidden = true,
+                            updatedAtMs = now
+                        )
+                        overrideDao.upsert(updated)
+                    }
+                }
+
+                DuplicateAction.DELETE_DUPLICATES -> {
+                    AppLogger.i(TAG, "Permanently deleting ${group.duplicates.size} duplicate channels for group ${group.groupId}")
+                    group.duplicates.forEach { dup ->
+                        favoriteDao.deleteByTarget(FavoriteTargetIds.live(dup.channel.channelIdentity), activeProfileId)
+                        overrideDao.deleteByIdentity(dup.channel.channelIdentity)
+                        channelDao.delete(dup.channel)
+                    }
+                }
+
+                DuplicateAction.IGNORE_GROUP -> {
+                    AppLogger.d(TAG, "Ignoring duplicate group: ${group.normalizedTitle}")
+                    persistIgnoredGroup(group.normalizedTitle)
+                }
+            }
+        }
+    }
+```
+
+---
+
+### 3. Phase 2 Report
+
+- **Completed functionality (verified in code)**:
+  - Process-death sync state recovery (`AppLifecycleSupervisor.reconcileOrphanedSyncStates` → `PlaylistSourceDao.resetOrphanedSyncStates`) and coroutine cancellation cleanup (`UnifiedCatalogRepository`, `UrlViewModel`, `PlaylistRepository`).
+  - Consistent `PlaylistFingerprint` identity computation across `M3uIptvProvider`, `UrlViewModel`, `PlaylistRepository`, and `XtreamIptvProvider`, plus non-destructive `PlaylistSyncEngine` endpoint/channel merging.
+  - Preservation of `ChannelUserOverrideEntity` across playlist syncs and enforcement of hidden/renamed/reordered overrides across `ChannelDao.getPagedChannels`, `UnifiedCatalogDao.getPagedChannels`, `ChannelDao.countAll`, `ChannelDao.getFavorites`, and `ChannelDao.getRecentlyPlayed`.
+  - Partial/truncated import and catastrophic shrinkage protection (`ResilientSyncPolicy` + `isComplete` / `wasTruncated`) across Live channels, VOD movies, and Series in `UnifiedCatalogRepository`, `UrlViewModel`, and `PlaylistRepository`.
+  - Duplicate clustering, endpoint merging, hiding, and `UnifiedFavoriteEntity` ledger migration in `DuplicateDetectionEngine` and `DuplicateCleanupRepository`.
+
+- **Remaining defects**:
+  - None identified in Phase 2 code paths; note that `DuplicateCleanupRepository` cleans/migrates `UnifiedFavoriteEntity` for the active profile only (`UnifiedFavoriteDao` currently exposes `deleteByTarget(targetId, profileId)` rather than cross-profile deletion by `targetId`).
+
+- **Modified classes**:
+  - `data/repository/PlaylistRepository.kt`
+  - `data/repository/UnifiedCatalogRepository.kt`
+  - `data/dao/ChannelDao.kt`
+  - `data/repository/DuplicateCleanupRepository.kt`
+
+- **Integration points**:
+  - `PlaylistRepository` / `UrlViewModel` / `UnifiedCatalogRepository` ↔ `M3uParser.parseExtended` ↔ `PlaylistFingerprint` ↔ `ResilientSyncPolicy` ↔ `PlaylistSyncEngine`
+  - `ChannelDao` / `UnifiedCatalogDao` ↔ `ChannelUserOverrideDao` ↔ `ChannelOrganizationRepository`
+  - `DuplicateCleanupRepository` ↔ `DuplicateDetectionEngine` ↔ `UnifiedFavoriteDao` / `ActiveProfileProvider`
+  - `AppLifecycleSupervisor` ↔ `PlaylistSourceDao.resetOrphanedSyncStates`
+
+- **Verification results**:
+  - Static code-path verification completed for all synchronization, identity, override projection, partial-import abort, and duplicate-resolution flows. Room query projections in `ChannelDao` match all `Channel` columns and `ChannelUserOverrideDao` schema.
+
+- **Limitations preventing full verification**:
+  - No Gradle build/Room annotation processor or device/instrumentation test runner is available in this environment to compile and execute Room migration/DAO queries or live playlist sync tests.
+
+Ready to proceed to **Phase 3: Live player** when you say **start phase 3**.
+
+
+
+
+
+
+
 
