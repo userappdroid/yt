@@ -1,975 +1,615 @@
-Below are **only the new or modified methods, attributes, and targeted edits** for **Phase 7 — EPG Completion**.
+Here is the Python script for **Batch 5 (5 classes — Channel Organization & Android TV Presenter/VOD Repo)**:
+
+1. `data/repository/ChannelOrganizationRepository.kt` — Adds deterministic tie-breakers (`displayNumber`, `displayTitle`) in `getOrganizedChannels()` and ignores blank custom group names in `createCustomGroup()`.
+2. `viewmodel/ChannelOrganizationViewModel.kt` — Adds `deleteCustomGroup(name)` and synchronizes in-memory `userOrderIndex` overrides after drag-and-drop reordering.
+3. `ui/organization/ChannelOrganizationFragment.kt` — Cleans up `btnIncludeHidden` listener in `setupListeners()`.
+4. `tv/TvChannelPresenter.kt` — Fixes missing imports (`VodMovieEntity`, `SeriesEntity`, `SearchItem`) and binds Now/Next EPG subtitles onto `Channel` cards.
+5. `data/repository/VodRepository.kt` — Exposes `getMoviesByCategory(...)` for Android TV category rows.
+
+```python
+#!/usr/bin/env python3
+from pathlib import Path
+
+BASE_DIR = Path("/home/username/AndroidStudioProjects/Ytvmate/app/src/main/java/vid/mat/app")
+
+FILES = {
+    "data/repository/ChannelOrganizationRepository.kt": """package vid.mat.app.data.repository
+
+import androidx.room.withTransaction
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.withContext
+import vid.mat.app.data.dao.ChannelDao
+import vid.mat.app.data.dao.ChannelUserOverrideDao
+import vid.mat.app.data.dao.CustomGroupDao
+import vid.mat.app.data.database.VideoUrlDatabase
+import vid.mat.app.data.model.ChannelUserOverrideEntity
+import vid.mat.app.data.model.CustomGroupEntity
+import vid.mat.app.data.model.OrganizedChannel
+import vid.mat.app.util.AppLogger
+import javax.inject.Inject
+import javax.inject.Singleton
 
-*(No full classes are repeated.)*
-
----
-
-### 1. XMLTV Parsing, Timezone & Error Handling (`epg/XmltvParser.kt`, `epg/EpgSourceResolver.kt`)
-
-#### `epg/XmltvParser.kt` — Fixed ISO/compact timezones, `<display-name>` handling, and no `Done` after `Error`
-```kotlin
-private fun createDateFormats(): List<SimpleDateFormat> = listOf(
-    "yyyyMMddHHmmss Z",
-    "yyyyMMddHHmmss",
-    "yyyy-MM-dd HH:mm:ss Z",
-    "yyyy-MM-dd HH:mm:ss"
-).map { pattern ->
-    SimpleDateFormat(pattern, Locale.US).apply {
-        timeZone = TimeZone.getTimeZone("UTC")
-        isLenient = false
-    }
-}
-
-fun parseXmltvTime(raw: String, prebuiltFormats: List<SimpleDateFormat> = createDateFormats()): Long {
-    if (raw.isBlank()) return 0L
-    val trimmed = raw.trim()
-
-    return try {
-        var normalized = trimmed
-            // Pad 12-digit compact stamps (yyyyMMddHHmm -> yyyyMMddHHmm00)
-            .replace(Regex("""^(\d{12})(?=\s|[+-]|Z|$)"""), "$100")
-            // Drop fractional seconds (".123" / ".123456")
-            .replace(Regex("""\.\d+(?=[Z\s+-]|$)"""), "")
-            // Expand 2-digit hour offsets (+02 -> +0200)
-            .replace(Regex("""([+-]\d{2})$"""), "$100")
-            // Compact "+HH:MM" -> "+HHMM"
-            .replace(Regex("""([+-]\d{2}):(\d{2})$"""), "$1$2")
-            .replace("T", " ")
-            .replace(Regex("""Z$"""), " +0000")
-            // Ensure space between timestamp and timezone offset for both compact and ISO dates
-            .replace(Regex("""(\d{14})([+-]\d{4})$"""), "$1 $2")
-            .replace(Regex("""(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})([+-]\d{4})$"""), "$1 $2")
-            .replace(Regex("""\s+"""), " ")
-            .trim()
-
-        for (sdf in prebuiltFormats) {
-            try {
-                val date = sdf.parse(normalized)
-                if (date != null) return date.time
-            } catch (_: Exception) {}
-        }
-        0L
-    } catch (_: Exception) {
-        0L
-    }
-}
-
-// Inside parse(...) XML pull loop:
-// 1) Track parse failure flag so Done is NOT emitted after Error:
-var hadParseError = false
-
-// 2) For "display-name" START_TAG, safely read non-blank display name:
-"display-name" -> {
-    if (currentChannelId != null && currentDisplayName == null) {
-        val candidate = runCatching { parser.nextText() }.getOrNull()?.trim()?.take(MAX_TITLE_LENGTH)
-        if (!candidate.isNullOrBlank()) {
-            currentDisplayName = candidate
-        }
-    }
-}
-
-// 3) In catch (e: XmlPullParserException):
-hadParseError = true
-AppLogger.w(TAG, "EPG parse interrupted after $programCount programs: ${e.message}")
-emit(
-    ParseResult.Error(
-        message = "EPG feed malformed at or after program $programCount",
-        cause = SensitiveDataSanitizer.sanitizeThrowable(e),
-        partialChannels = channelCount,
-        partialPrograms = programCount
-    )
-)
-
-// 4) Guard Done emission:
-if (!hadParseError) {
-    emit(ParseResult.Done(channelCount, programCount))
-    AppLogger.i(TAG, "EPG parse complete: $channelCount channels, $programCount programs")
-}
-```
-
-#### `epg/EpgSourceResolver.kt` — URL-encode Xtream credentials in XMLTV URL
-```kotlin
-suspend fun resolve(source: String): Result<String> {
-    val trimmed = source.trim()
-    if (!isXtreamAccountRef(trimmed)) return Result.success(trimmed)
-
-    val id = accountId(trimmed)
-        ?: return Result.failure(IllegalArgumentException("Invalid Xtream EPG source reference"))
-
-    return when (val credentials = accountManager.resolveCredentials(id)) {
-        is XtreamAccountManager.CredentialsResolution.Success -> {
-            val encodedUser = android.net.Uri.encode(credentials.username)
-            val encodedPass = android.net.Uri.encode(credentials.pass)
-            Result.success("${credentials.serverUrl.trimEnd('/')}/xmltv.php?username=$encodedUser&password=$encodedPass")
-        }
-        XtreamAccountManager.CredentialsResolution.NeedsReauthentication ->
-            Result.failure(IllegalStateException("Xtream credentials require re-authentication"))
-        is XtreamAccountManager.CredentialsResolution.Error ->
-            Result.failure(IllegalStateException(credentials.message))
-    }
-}
-```
-
----
-
-### 2. Collision-Resistant Program IDs & Channel Alignment (`epg/EpgRepository.kt`, `epg/EpgAlignmentEngine.kt`)
-
-#### `epg/EpgRepository.kt` — SHA-256 63-bit `stableProgramId` & Cancellation propagation
-```kotlin
-// Inside fetchAndStore(...), propagate CancellationException before catch (e: Exception)
-// and pass a reused MessageDigest per parse:
-val digest = java.security.MessageDigest.getInstance("SHA-256")
-// ... inside XmltvParser.ParseResult.Program:
-id = stableProgramId(sourceKey, p.channelId, p.startMs, p.stopMs, p.title, digest)
-// ... in catch:
-} catch (e: kotlinx.coroutines.CancellationException) {
-    throw e
-} catch (e: Exception) {
-    // existing error handling
-}
-
-private fun stableProgramId(
-    sourceKey: String,
-    channelId: String,
-    startMs: Long,
-    stopMs: Long,
-    title: String,
-    digest: java.security.MessageDigest = java.security.MessageDigest.getInstance("SHA-256")
-): Long {
-    digest.reset()
-    val payload = "$sourceKey\u0000$channelId\u0000$startMs\u0000$stopMs\u0000$title"
-    val hash = digest.digest(payload.toByteArray(Charsets.UTF_8))
-    var value = 0L
-    for (i in 0 until 8) {
-        value = (value shl 8) or (hash[i].toLong() and 0xFFL)
-    }
-    return value and Long.MAX_VALUE
-}
-```
-
-#### `epg/EpgAlignmentEngine.kt` — Batch channel-to-XMLTV resolution + manual source fallback
-```kotlin
-suspend fun findCurrentProgram(
-    channel: Channel,
-    nowMs: Long = System.currentTimeMillis(),
-    fallbackSourceKey: String = ""
-): EpgProgram? {
-    val sourceKey = sourceDao.getById(channel.sourceId)?.epgUrl?.trim()
-        ?.takeIf { it.isNotBlank() }
-        ?: fallbackSourceKey.trim()
-
-    val candidates = buildList {
-        channel.tvgId?.takeIf { it.isNotBlank() }?.let(::add)
-        channel.externalId?.takeIf { it.isNotBlank() && it != channel.tvgId }?.let(::add)
-        channel.tvgName?.takeIf { it.isNotBlank() }?.let(::add)
-        ChannelNameNormalizer.normalize(channel.title).takeIf { it.isNotBlank() }?.let(::add)
-    }.distinct()
-
-    for (candidate in candidates) {
-        val program = if (sourceKey.isNotBlank()) {
-            epgDao.getCurrentProgram(sourceKey, candidate, nowMs)
-        } else {
-            epgDao.getCurrentProgramAnySource(candidate, nowMs)
-        }
-        if (program != null) return program
-    }
-    return null
-}
-
-/**
- * Resolves the best XMLTV `channelId` for each channel using exact `tvgId` / `externalId` /
- * `tvgName` matches first, then normalized `EpgChannel.displayName` fallback.
- */
-suspend fun resolveChannelGuideIds(channels: List<Channel>): Map<Long, String> {
-    if (channels.isEmpty()) return emptyMap()
-    val epgChannels = runCatching { epgDao.getAllChannels() }.getOrDefault(emptyList())
-    if (epgChannels.isEmpty()) {
-        return channels.mapNotNull { ch ->
-            val fallback = ch.tvgId?.takeIf { it.isNotBlank() } ?: ch.externalId?.takeIf { it.isNotBlank() }
-            fallback?.let { ch.channelId to it }
-        }.toMap()
-    }
-
-    val byXmltvIdLower = HashMap<String, String>(epgChannels.size)
-    val byNormalizedName = HashMap<String, String>(epgChannels.size)
-    for (epg in epgChannels) {
-        byXmltvIdLower.putIfAbsent(epg.xmltvId.trim().lowercase(), epg.xmltvId)
-        val norm = ChannelNameNormalizer.normalize(epg.displayName)
-        if (norm.isNotBlank()) byNormalizedName.putIfAbsent(norm, epg.xmltvId)
-    }
-
-    val result = HashMap<Long, String>(channels.size)
-    for (ch in channels) {
-        val directMatch = listOfNotNull(ch.tvgId, ch.externalId, ch.tvgName)
-            .map { it.trim() }
-            .firstNotNullOfOrNull { candidate ->
-                if (candidate.isBlank()) null else byXmltvIdLower[candidate.lowercase()]
-            }
-        val matchedId = directMatch
-            ?: byNormalizedName[ChannelNameNormalizer.normalize(ch.title)]
-            ?: ch.tvgId?.takeIf { it.isNotBlank() }
-            ?: ch.externalId?.takeIf { it.isNotBlank() }
-
-        if (!matchedId.isNullOrBlank()) {
-            result[ch.channelId] = matchedId
-        }
-    }
-    return result
-}
-```
-
----
-
-### 3. ViewModel Conflation Fix & Deduplicated Now/Next Requests (`epg/EpgViewModel.kt`)
-
-#### `epg/EpgViewModel.kt` — In-flight deduplication & non-conflating update stream
-```kotlin
-private val inFlightNowNext = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
-
-private val _nowNextEvent = kotlinx.coroutines.flow.MutableSharedFlow<Pair<String, NowAndNext>>(
-    extraBufferCapacity = 64
-)
-val nowNextEvent: kotlinx.coroutines.flow.SharedFlow<Pair<String, NowAndNext>> = _nowNextEvent
-
-fun requestNowAndNext(tvgId: String) {
-    val cleanId = tvgId.trim()
-    if (cleanId.isBlank()) return
-    val key = _epgUrl.value.trim()
-    if (nowNextCache.getCachedIfFresh(cleanId, key) != null) return
-    val dedupKey = "$key\u0000$cleanId"
-    if (!inFlightNowNext.add(dedupKey)) return
-
-    viewModelScope.launch(Dispatchers.IO) {
-        try {
-            val result = nowNextCache.getNowAndNext(cleanId, sourceKey = key)
-            _nowNextUpdates.value = Pair(cleanId, result)
-            _nowNextEvent.tryEmit(Pair(cleanId, result))
-        } finally {
-            inFlightNowNext.remove(dedupKey)
-        }
-    }
-}
-```
-
----
-
-### 4. Reminder Uniqueness & Notification Safety (`epg/reminder/EpgReminderScheduler.kt`, `EpgReminderWorker.kt`)
-
-#### `epg/reminder/EpgReminderScheduler.kt` — Unique work per program & skip expired programs
-```kotlin
-fun scheduleReminder(
-    context: Context,
-    program: EpgProgram,
-    channelName: String,
-    streamUrl: String?
-) {
-    val nowMs = System.currentTimeMillis()
-    if (program.stopMs <= nowMs) return
-
-    val delayMs = (program.startMs - nowMs - REMINDER_LEAD_TIME_MS).coerceAtLeast(0L)
-    val workRequest = OneTimeWorkRequestBuilder<EpgReminderWorker>()
-        .setInitialDelay(delayMs, TimeUnit.MILLISECONDS)
-        .setInputData(
-            workDataOf(
-                EpgReminderWorker.KEY_PROGRAM_TITLE to program.title,
-                EpgReminderWorker.KEY_CHANNEL_NAME to channelName,
-                EpgReminderWorker.KEY_STREAM_URL to (streamUrl ?: ""),
-                EpgReminderWorker.KEY_PROGRAM_ID to program.id
-            )
-        )
-        .addTag("reminder_${program.id}")
-        .build()
-
-    WorkManager.getInstance(context).enqueueUniqueWork(
-        "reminder_${program.id}",
-        androidx.work.ExistingWorkPolicy.REPLACE,
-        workRequest
-    )
-}
-```
-
-#### `epg/reminder/EpgReminderWorker.kt` — Unique notification ID & Android 13+ permission check
-```kotlin
-companion object {
-    const val KEY_PROGRAM_ID = "program_id"
-}
-
-override suspend fun doWork(): Result {
-    val programTitle = inputData.getString(KEY_PROGRAM_TITLE) ?: "Upcoming Show"
-    val channelName = inputData.getString(KEY_CHANNEL_NAME) ?: "Live TV"
-    val streamUrl = inputData.getString(KEY_STREAM_URL).orEmpty()
-    val programId = inputData.getLong(KEY_PROGRAM_ID, programTitle.hashCode().toLong())
-
-    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
-        androidx.core.content.ContextCompat.checkSelfPermission(
-            applicationContext,
-            android.Manifest.permission.POST_NOTIFICATIONS
-        ) != android.content.pm.PackageManager.PERMISSION_GRANTED
-    ) {
-        return Result.success()
-    }
-
-    createNotificationChannel()
-
-    val targetClass = if (streamUrl.isNotBlank()) MediaPlayerActivity::class.java else vid.mat.app.ui.MainActivity::class.java
-    val intent = Intent(applicationContext, targetClass).apply {
-        flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
-        if (streamUrl.isNotBlank()) {
-            putExtra(MediaPlayerActivity.EXTRA_MEDIA_PATH, streamUrl)
-            putExtra(MediaPlayerActivity.EXTRA_MEDIA_TITLE, channelName)
-        }
-    }
-    val notifId = ("${programId}_$channelName").hashCode()
-    val pendingIntent = PendingIntent.getActivity(
-        applicationContext,
-        notifId,
-        intent,
-        PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-    )
-
-    val notification = NotificationCompat.Builder(applicationContext, CHANNEL_ID)
-        .setSmallIcon(R.drawable.ic_notification)
-        .setContentTitle("Starting Soon: $programTitle")
-        .setContentText("Tune in to $channelName now!")
-        .setPriority(NotificationCompat.PRIORITY_HIGH)
-        .setAutoCancel(true)
-        .setContentIntent(pendingIntent)
-        .build()
-
-    val notificationManager = applicationContext.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-    notificationManager.notify(notifId, notification)
-    return Result.success()
-}
-```
-
----
-
-### 5. EPG Matrix Rendering, Alignment & Details (`EpgTimelineMatrixView.kt`, `EpgGuideTimelineFragment.kt`, `EpgProgramDetailsBottomSheet.kt`)
-
-#### `ui/epg/EpgTimelineMatrixView.kt` — Pre-allocated Paints (zero `onDraw` allocations) + `channelGuideIdMap` lookup
-```kotlin
-// Add class-level Paint fields & guide-ID map:
-private var channelGuideIdMap: Map<Long, String> = emptyMap()
-
-private val dimProgramBgPaint = Paint().apply { color = 0xFF0D131F.toInt() }
-private val dimProgramBorderPaint = Paint().apply {
-    style = Paint.Style.STROKE
-    strokeWidth = dp(1f)
-    color = 0x0AFFFFFF
-}
-private val activeProgramPaint = Paint()
-private val activeProgramRectCheck = RectF()
-private val dimTitlePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-    color = 0xFF475569.toInt()
-    textSize = dp(13.5f)
-    typeface = Typeface.create("sans-serif-medium", Typeface.BOLD)
-}
-private val brandPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-    color = 0xFFEF4444.toInt()
-    textSize = dp(13f)
-    typeface = Typeface.DEFAULT_BOLD
-}
-
-fun setData(
-    newChannels: List<Channel>,
-    newPrograms: Map<String, List<EpgProgram>>,
-    startEpochMs: Long,
-    guideIdByChannelId: Map<Long, String> = emptyMap()
-) {
-    this.channels = newChannels
-    this.programsMap = newPrograms
-    this.timelineStartMs = startEpochMs
-    this.channelGuideIdMap = guideIdByChannelId
-    invalidate()
-}
-
-private fun programsForChannel(channel: Channel): List<EpgProgram> {
-    val alignedKey = channelGuideIdMap[channel.channelId]
-    if (!alignedKey.isNullOrBlank()) {
-        programsMap[alignedKey]?.let { return it }
-    }
-    channel.tvgId?.takeIf { it.isNotBlank() }?.let { programsMap[it]?.let { list -> return list } }
-    channel.externalId?.takeIf { it.isNotBlank() }?.let { programsMap[it]?.let { list -> return list } }
-    return emptyList()
-}
-
-// Inside onDraw(canvas: Canvas):
-// Replace `val programs = programsMap[channel.tvgId] ?: emptyList()` with:
-val programs = programsForChannel(channel)
-
-// Replace per-frame Paint allocations with pre-allocated paints:
-if (isNow) {
-    activeProgramPaint.shader = LinearGradient(
-        rect.left, rect.top, rect.right, rect.bottom,
-        0xFF1E3A8A.toInt(), 0xFF1E293B.toInt(), Shader.TileMode.CLAMP
-    )
-    canvas.drawRoundRect(rect, dp(8f), dp(8f), activeProgramPaint)
-    canvas.drawRoundRect(rect, dp(8f), dp(8f), programActiveBorderPaint)
-} else if (isPast) {
-    if (catchupAvailable) {
-        canvas.drawRoundRect(rect, dp(8f), dp(8f), programBgPaint)
-        canvas.drawRoundRect(rect, dp(8f), dp(8f), programBorderPaint)
-        if (rect.width() > dp(36f)) {
-            replayIcon?.setBounds(
-                (rect.right - dp(24f)).toInt(),
-                (rect.top + dp(6f)).toInt(),
-                (rect.right - dp(6f)).toInt(),
-                (rect.top + dp(24f)).toInt()
-            )
-            replayIcon?.draw(canvas)
-        }
-    } else {
-        canvas.drawRoundRect(rect, dp(8f), dp(8f), dimProgramBgPaint)
-        canvas.drawRoundRect(rect, dp(8f), dp(8f), dimProgramBorderPaint)
-    }
-} else {
-    canvas.drawRoundRect(rect, dp(8f), dp(8f), programBgPaint)
-    canvas.drawRoundRect(rect, dp(8f), dp(8f), programBorderPaint)
-}
-
-// Replace localTitlePaint with:
-val currentTitlePaint = if (isPast && !catchupAvailable) dimTitlePaint else titlePaint
-canvas.drawText(prog.title, textStartX, rect.top + dp(24f), currentTitlePaint)
-
-// Inside handleTouchTap(x: Float, y: Float):
-val tappedEpochMs = timelineStartMs + (((x - channelColumnWidth) / minuteWidth) * 60000).toLong()
-val program = programsForChannel(channel).firstOrNull { it.startMs <= tappedEpochMs && it.stopMs > tappedEpochMs }
-```
-
-#### `ui/epg/EpgGuideTimelineFragment.kt` — Inject `EpgAlignmentEngine`, align all matched guide IDs & auto-refresh when stale
-```kotlin
-@Inject
-lateinit var epgAlignmentEngine: vid.mat.app.epg.EpgAlignmentEngine
-
-private fun observeEpgData() {
-    viewLifecycleOwner.lifecycleScope.launch {
-        viewLifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {
-            if (epgViewModel.needsRefresh()) {
-                epgViewModel.refreshEpg()
-            }
-
-            allChannels = channelRepository.getAllChannels(5_000)
-            val alignedMap = epgAlignmentEngine.resolveChannelGuideIds(allChannels)
-            val guideIds = (allChannels.flatMap { listOfNotNull(it.tvgId, it.externalId) } + alignedMap.values)
-                .map { it.trim() }
-                .filter { it.isNotEmpty() }
-                .distinct()
-
-            epgViewModel.guideFromMs.collectLatest { startMs ->
-                epgViewModel.getProgramsForChannels(
-                    guideIds,
-                    startMs,
-                    startMs + 24 * 3600 * 1000L
-                ).collectLatest { programs ->
-                    val grouped = programs.groupBy { it.channelId }
-                    binding.epgMatrixView.setData(allChannels, grouped, startMs, alignedMap)
-                }
-            }
-        }
-    }
-}
-```
-
----
-
-### Phase 7 Completion Notes
-- **Completed in code above**:
-  - `XmltvParser` now handles 12-digit compact dates, 2-digit timezone offsets, ISO-8601 `T...+HH:MM` without spaces, non-blank `<display-name>` selection, and avoids emitting `Done` after a parse error.
-  - `EpgSourceResolver` URL-encodes Xtream usernames and passwords in `xmltv.php` queries.
-  - `EpgRepository` uses 63-bit SHA-256 `stableProgramId` to prevent hash overwrites and preserves `CancellationException`.
-  - `EpgAlignmentEngine` supports manual source fallback and batch channel-to-XMLTV resolution (`tvgId`, `externalId`, `tvgName`, normalized `displayName`).
-  - `EpgViewModel.requestNowAndNext` deduplicates in-flight requests and provides a buffered `nowNextEvent` `SharedFlow` so RecyclerView binds don't drop updates.
-  - `EpgReminderScheduler` & `EpgReminderWorker` enforce unique work per program, skip past programs, check `POST_NOTIFICATIONS` permission on Android 13+, and avoid notification ID collisions.
-  - `EpgTimelineMatrixView` eliminates `onDraw` `Paint` allocations and supports `EpgAlignmentEngine`-resolved guide IDs in both rendering and tap handling; `EpgGuideTimelineFragment` auto-refreshes stale EPG data.
-- **Note for Phase 8 & 14**: `EpgProgramDetailsBottomSheet` parental control gating and catch-up consolidation will be completed in Phase 8 / Phase 14.
-
-Confirm when you are ready to proceed to **Phase 8 — Catch-up TV completion**.
-Below are **only the new or modified methods, attributes, and targeted edits** for **Phase 8 — Catch-Up TV Completion**.
-
-*(No full classes are repeated.)*
-
----
-
-### 1. Unified Catch-Up Resolution & Removal of Conflicting Paths (`catchup/UnifiedCatchupEngine.kt`, `catchup/CatchupUrlBuilder.kt`, `provider/StreamResolver.kt`)
-
-#### `catchup/CatchupUrlBuilder.kt` — Safe query parameter encoding & trailing slash handling for Xtream/Flussonic/Append
-```kotlin
-fun buildCatchupUrl(
-    streamUrl: String,
-    metadata: CatchupMetadata,
-    startEpochMs: Long,
-    durationSeconds: Long
-): String {
-    if (durationSeconds <= 0L || startEpochMs <= 0L) return streamUrl
-    val durationMinutes = (durationSeconds / 60L).coerceAtLeast(1L)
-    val startDate = Date(startEpochMs)
-
-    return when (metadata.catchupType) {
-        CatchupType.XTREAM -> {
-            val formattedDate = synchronized(xtreamDateFormat) { xtreamDateFormat.format(startDate) }
-            if (streamUrl.contains("/live/")) {
-                streamUrl.replace("/live/", "/timeshift/")
-                    .replace(Regex("/([^/]+)\\.(m3u8|ts)(\\?.*)?$"), "/$durationMinutes/$formattedDate/$1.m3u8$3")
-            } else {
-                streamUrl
-            }
-        }
-        CatchupType.FLUSSONIC -> {
-            val startSec = startEpochMs / 1000L
-            val cleanBase = streamUrl.substringBefore('?')
-            val query = streamUrl.substringAfter('?', "")
-            val updatedBase = when {
-                cleanBase.endsWith(".m3u8", ignoreCase = true) ->
-                    cleanBase.replace(Regex("/[^/]+\\.m3u8$", RegexOption.IGNORE_CASE), "/timeshift_abs-$startSec.m3u8")
-                cleanBase.endsWith(".ts", ignoreCase = true) ->
-                    cleanBase.replace(Regex("/[^/]+\\.ts$", RegexOption.IGNORE_CASE), "/timeshift_abs-$startSec.ts")
-                else ->
-                    "${cleanBase.trimEnd('/')}/video-$startSec-$durationSeconds.m3u8"
-            }
-            if (query.isNotBlank()) "$updatedBase?$query" else updatedBase
-        }
-        CatchupType.SHIFT -> {
-            val offsetSec = ((System.currentTimeMillis() - startEpochMs) / 1000L).coerceAtLeast(0L)
-            val separator = if (streamUrl.contains("?")) "&" else "?"
-            "$streamUrl${separator}timeshift=$offsetSec"
-        }
-        CatchupType.APPEND, CatchupType.DEFAULT -> {
-            val template = metadata.sourceTemplate?.takeIf { it.isNotBlank() } ?: "?utc={utc}&lutc={lutc}"
-            val startUtc = startEpochMs / 1000L
-            val endUtc = startUtc + durationSeconds
-            val nowUtc = System.currentTimeMillis() / 1000L
-            val offsetSec = (nowUtc - startUtc).coerceAtLeast(0L)
-            val resolved = template
-                .replace("{utc}", startUtc.toString())
-                .replace("{lutc}", nowUtc.toString())
-                .replace("{start}", startUtc.toString())
-                .replace("{end}", endUtc.toString())
-                .replace("{utcend}", endUtc.toString())
-                .replace("{duration}", durationSeconds.toString())
-                .replace("{offset}", offsetSec.toString())
-
-            when {
-                resolved.startsWith("http://", ignoreCase = true) ||
-                    resolved.startsWith("https://", ignoreCase = true) -> resolved
-                else -> {
-                    val separator = if (streamUrl.contains("?")) "&" else "?"
-                    "$streamUrl$separator${resolved.removePrefix("?").removePrefix("&")}"
-                }
-            }
-        }
-        CatchupType.NONE -> streamUrl
-    }
-}
-```
-
-#### `catchup/UnifiedCatchupEngine.kt` — Authoritative catch-up resolver returning validated `StreamDescriptor` (used by `StreamResolver` & `EpgProgramDetailsBottomSheet`)
-```kotlin
-// Inject PlaylistSourceDao so UnifiedCatchupEngine can resolve Xtream & M3U catch-up identically:
 @Singleton
-class UnifiedCatchupEngine @Inject constructor(
+class ChannelOrganizationRepository @Inject constructor(
+    private val database: VideoUrlDatabase,
     private val channelDao: ChannelDao,
-    private val endpointDao: StreamEndpointDao,
-    private val sourceDao: vid.mat.app.data.dao.PlaylistSourceDao,
-    private val xtreamAccountManager: XtreamAccountManager
+    private val overrideDao: ChannelUserOverrideDao,
+    private val groupDao: CustomGroupDao
 ) {
+
     companion object {
-        private const val TAG = "UnifiedCatchupEngine"
-        private const val MS_PER_DAY = 86_400_000L
+        private const val TAG = "ChannelOrganizationRepository"
     }
 
-    /**
-     * Authoritative catch-up stream resolution entry point for a persisted channel and time window.
-     * Validates archive availability, retention days, endpoint headers, and Xtream credentials.
-     */
-    suspend fun resolveCatchupDescriptor(
-        channelId: Long,
-        startMs: Long,
-        stopMs: Long
-    ): Result<StreamDescriptor> {
-        if (channelId <= 0L || startMs <= 0L || stopMs <= startMs) {
-            return Result.failure(IllegalStateException("Catch-up is not available for this time range"))
-        }
+    val customGroups: Flow<List<CustomGroupEntity>> = groupDao.getAllFlow()
 
-        val channel = channelDao.getById(channelId)
-            ?: return Result.failure(IllegalStateException("Channel not found"))
+    suspend fun getOrganizedChannels(
+        groupFilter: String? = null,
+        includeHidden: Boolean = false
+    ): List<OrganizedChannel> = withContext(Dispatchers.IO) {
+        val rawChannels = channelDao.getAllOrdered(100_000)
+        val overridesMap = overrideDao.getAll().associateBy { it.channelIdentity }
 
-        val nowMs = System.currentTimeMillis()
-        val ageMs = nowMs - stopMs
-        val retentionMs = channel.catchupDays.toLong() * MS_PER_DAY
-        if (channel.catchupDays <= 0 || ageMs >= retentionMs) {
-            return Result.failure(IllegalStateException("Catch-up is not available or has expired for this program"))
-        }
+        rawChannels.map { ch ->
+            val override = overridesMap[ch.channelIdentity]
+            OrganizedChannel(channel = ch, override = override)
+        }.filter { item ->
+            (includeHidden || !item.isHidden) &&
+                (groupFilter == null || item.displayGroup.equals(groupFilter, ignoreCase = true))
+        }.sortedWith(
+            compareBy<OrganizedChannel> { it.orderIndex }
+                .thenBy { it.displayNumber ?: Int.MAX_VALUE }
+                .thenBy { it.displayTitle }
+        )
+    }
 
-        val durationSec = (stopMs - startMs) / 1000L
-        if (durationSec <= 0L) {
-            return Result.failure(IllegalStateException("Invalid program duration for catch-up"))
-        }
+    suspend fun saveChannelOverride(
+        channelIdentity: String,
+        customTitle: String?,
+        customGroup: String?,
+        customLogoUrl: String?,
+        customNumber: Int?
+    ) = withContext(Dispatchers.IO) {
+        AppLogger.i(TAG, "Saving user overrides for channel identity '$channelIdentity'")
+        val existing = overrideDao.getByIdentity(channelIdentity)
+        val updated = (existing ?: ChannelUserOverrideEntity(channelIdentity = channelIdentity)).copy(
+            customTitle = customTitle?.trim()?.takeIf { it.isNotBlank() },
+            customGroupTitle = customGroup?.trim()?.takeIf { it.isNotBlank() },
+            customLogoUrl = customLogoUrl?.trim()?.takeIf { it.isNotBlank() },
+            customChannelNumber = customNumber,
+            updatedAtMs = System.currentTimeMillis()
+        )
+        overrideDao.upsert(updated)
+    }
 
-        val endpoints = endpointDao.getEndpointsForChannel(channelId)
-            .sortedWith(
-                compareByDescending<vid.mat.app.data.model.StreamEndpoint> { it.isWorking }
-                    .thenByDescending { it.priority }
-                    .thenBy { it.failureCount }
-            )
-        val primaryEndpoint = endpoints.firstOrNull()
-            ?: return Result.failure(IllegalStateException("No endpoints available for channel '${channel.title}'"))
-
-        val source = sourceDao.getById(channel.sourceId)
-        val accountId = source?.xtreamAccountId
-        if (accountId != null) {
-            return when (val creds = xtreamAccountManager.resolveCredentials(accountId)) {
-                is XtreamAccountManager.CredentialsResolution.Success -> {
-                    val formattedDate = synchronized(xtreamDateFormat) { xtreamDateFormat.format(Date(startMs)) }
-                    val durationMin = (durationSec / 60L).coerceAtLeast(1L)
-                    val cleanServer = creds.serverUrl.trimEnd('/')
-                    val streamId = channel.externalId?.takeIf { it.isNotBlank() }
-                        ?: primaryEndpoint.url.substringAfterLast('/').substringBefore('.')
-                            .takeIf { it.isNotBlank() }
-                        ?: return Result.failure(IllegalStateException("Missing stream ID for Xtream catch-up"))
-
-                    val uri = "$cleanServer/timeshift/X-AUTH-INJECT/$durationMin/$formattedDate/$streamId.m3u8"
-                    Result.success(
-                        StreamDescriptor(
-                            streamUri = uri,
-                            containerFormat = "m3u8",
-                            headers = buildMap {
-                                put("User-Agent", primaryEndpoint.userAgent ?: "IPTVSmartersPlayer")
-                                primaryEndpoint.referer?.value?.let { put("Referer", it) }
-                                primaryEndpoint.cookie?.value?.let { put("Cookie", it) }
-                                primaryEndpoint.authorization?.value?.let { put("Authorization", it) }
-                            },
-                            userAgent = primaryEndpoint.userAgent ?: "IPTVSmartersPlayer",
-                            isLive = false,
-                            xtreamUser = creds.username,
-                            xtreamPass = creds.pass
+    suspend fun reorderChannels(orderedIdentities: List<String>) = withContext(Dispatchers.IO) {
+        AppLogger.i(TAG, "Persisting user drag-and-drop order for ${orderedIdentities.size} channels")
+        val now = System.currentTimeMillis()
+        database.withTransaction {
+            orderedIdentities.forEachIndexed { index, identity ->
+                val existing = overrideDao.getByIdentity(identity)
+                if (existing != null) {
+                    overrideDao.updateOrderIndex(identity, index, now)
+                } else {
+                    overrideDao.upsert(
+                        ChannelUserOverrideEntity(
+                            channelIdentity = identity,
+                            userOrderIndex = index,
+                            updatedAtMs = now
                         )
                     )
                 }
-                XtreamAccountManager.CredentialsResolution.NeedsReauthentication ->
-                    Result.failure(IllegalStateException("Xtream credentials require re-authentication"))
-                is XtreamAccountManager.CredentialsResolution.Error ->
-                    Result.failure(IllegalStateException(creds.message))
             }
         }
-
-        val inferredType = inferCatchupType(primaryEndpoint.url, channel.catchupSource)
-        val metadata = CatchupMetadata(
-            channelId = channelId,
-            catchupType = inferredType,
-            days = channel.catchupDays,
-            sourceTemplate = channel.catchupSource
-        )
-        val resolvedUrl = CatchupUrlBuilder.buildCatchupUrl(
-            streamUrl = primaryEndpoint.url,
-            metadata = metadata,
-            startEpochMs = startMs,
-            durationSeconds = durationSec
-        )
-
-        return Result.success(
-            StreamDescriptor(
-                streamUri = resolvedUrl,
-                containerFormat = if (resolvedUrl.contains(".ts", ignoreCase = true)) "ts" else "m3u8",
-                headers = buildMap {
-                    primaryEndpoint.userAgent?.let { put("User-Agent", it) }
-                    primaryEndpoint.referer?.value?.let { put("Referer", it) }
-                    primaryEndpoint.cookie?.value?.let { put("Cookie", it) }
-                    primaryEndpoint.authorization?.value?.let { put("Authorization", it) }
-                },
-                userAgent = primaryEndpoint.userAgent,
-                isLive = false
-            )
-        )
     }
 
-    suspend fun resolveCatchupStream(channelId: Long, program: EpgProgram): String? {
-        val descriptor = resolveCatchupDescriptor(channelId, program.startMs, program.stopMs).getOrNull()
-            ?: return null
-        return if (!descriptor.xtreamUser.isNullOrBlank() && !descriptor.xtreamPass.isNullOrBlank()) {
-            descriptor.streamUri.replace(
-                "/X-AUTH-INJECT/",
-                "/${android.net.Uri.encode(descriptor.xtreamUser)}/${android.net.Uri.encode(descriptor.xtreamPass)}/"
-            )
+    suspend fun setChannelHidden(channelIdentity: String, isHidden: Boolean) = withContext(Dispatchers.IO) {
+        val now = System.currentTimeMillis()
+        val existing = overrideDao.getByIdentity(channelIdentity)
+        if (existing != null) {
+            overrideDao.setHidden(channelIdentity, isHidden, now)
         } else {
-            descriptor.streamUri
+            overrideDao.upsert(
+                ChannelUserOverrideEntity(
+                    channelIdentity = channelIdentity,
+                    isHidden = isHidden,
+                    updatedAtMs = now
+                )
+            )
         }
     }
 
-    private fun inferCatchupType(streamUrl: String, sourceTemplate: String?): CatchupType {
-        val tmpl = sourceTemplate?.lowercase().orEmpty()
-        return when {
-            tmpl.contains("timeshift_abs") || tmpl.contains("video-") || streamUrl.contains("flussonic", ignoreCase = true) ->
-                CatchupType.FLUSSONIC
-            tmpl.contains("timeshift=") -> CatchupType.SHIFT
-            tmpl.isNotBlank() -> CatchupType.APPEND
-            else -> CatchupType.DEFAULT
+    suspend fun createCustomGroup(name: String) = withContext(Dispatchers.IO) {
+        val trimmed = name.trim()
+        if (trimmed.isNotBlank()) {
+            groupDao.insert(CustomGroupEntity(name = trimmed))
         }
     }
-}
-```
 
-#### `di/AppModule.kt` — Update `provideUnifiedCatchupEngine` to pass `PlaylistSourceDao`
-```kotlin
-@Provides
-@Singleton
-fun provideUnifiedCatchupEngine(
-    channelDao: ChannelDao,
-    endpointDao: StreamEndpointDao,
-    sourceDao: PlaylistSourceDao,
-    xtreamAccountManager: XtreamAccountManager
-): UnifiedCatchupEngine = UnifiedCatchupEngine(channelDao, endpointDao, sourceDao, xtreamAccountManager)
-```
-
----
-
-### 2. StreamResolver Delegation & EPG Catch-Up Integration (`StreamResolver.kt`, `EpgProgramDetailsBottomSheet.kt`, `M3uIptvProvider.kt`)
-
-#### `provider/StreamResolver.kt` — Delegate `catchup_` resolution directly to `UnifiedCatchupEngine`
-```kotlin
-// Add `private val unifiedCatchupEngine: vid.mat.app.catchup.UnifiedCatchupEngine` to constructor,
-// and replace section 4 ("4. Catchup replay") with:
-if (itemKey.startsWith("catchup_")) {
-    val parts = itemKey.split("_")
-    val chId = parts.getOrNull(1)?.toLongOrNull() ?: 0L
-    val startMs = parts.getOrNull(2)?.toLongOrNull() ?: 0L
-    val stopMs = parts.getOrNull(3)?.toLongOrNull() ?: 0L
-
-    val channel = channelDao.getById(chId)
-        ?: return Result.failure(IllegalStateException("Channel not found"))
-    if (parentalGatekeeper.isChannelRestricted(channel)) {
-        return Result.failure(SecurityException("Channel is restricted by Parental Controls"))
+    suspend fun deleteCustomGroup(name: String) = withContext(Dispatchers.IO) {
+        groupDao.deleteByName(name.trim())
     }
 
-    val descriptor = unifiedCatchupEngine.resolveCatchupDescriptor(chId, startMs, stopMs)
-        .getOrElse { return Result.failure(it) }
-
-    val validation = NetworkSecurityValidator.validateUri(
-        descriptor.streamUri,
-        NetworkSecurityValidator.resolveStreamContext(descriptor.streamUri)
-    )
-    if (validation !is NetworkSecurityValidator.UrlValidationResult.Valid) {
-        return Result.failure(SecurityException("Resolved catch-up URL rejected by security policy"))
+    suspend fun restoreOriginalChannel(channelIdentity: String) = withContext(Dispatchers.IO) {
+        AppLogger.i(TAG, "Restoring channel '$channelIdentity' to raw provider defaults")
+        overrideDao.deleteByIdentity(channelIdentity)
     }
 
-    val candidate = StreamCandidate(
-        endpointId = itemKey,
-        uri = validation.sanitizedUrl.toUri(),
-        protocol = descriptor.containerFormat,
-        headers = OkHttpStreamingClient.StreamHeaders(
-            userAgent = descriptor.userAgent ?: descriptor.headers["User-Agent"],
-            referer = descriptor.headers["Referer"],
-            cookie = descriptor.headers["Cookie"],
-            authorization = descriptor.headers["Authorization"],
-            xtreamUser = descriptor.xtreamUser,
-            xtreamPass = descriptor.xtreamPass
-        )
-    )
-    return Result.success(listOf(StreamMetadataExtractor.enrichCandidate(candidate, channel.title)))
-}
-```
-
-#### `di/AppModule.kt` — Update `provideStreamResolver` to pass `unifiedCatchupEngine`
-```kotlin
-@Provides
-@Singleton
-fun provideStreamResolver(
-    @ApplicationContext context: Context,
-    channelDao: ChannelDao,
-    endpointDao: StreamEndpointDao,
-    sourceDao: PlaylistSourceDao,
-    videoUrlDao: VideoUrlDao,
-    vodMovieDao: VodMovieDao,
-    seriesDao: SeriesDao,
-    providerFactory: IptvProviderFactory,
-    xtreamAccountManager: XtreamAccountManager,
-    parentalGatekeeper: ParentalGatekeeper,
-    unifiedCatchupEngine: UnifiedCatchupEngine,
-    okHttpClient: OkHttpClient
-): StreamResolver = StreamResolver(
-    context, channelDao, endpointDao, sourceDao, videoUrlDao,
-    vodMovieDao, seriesDao, providerFactory, xtreamAccountManager,
-    parentalGatekeeper, unifiedCatchupEngine, okHttpClient
-)
-```
-
-#### `provider/m3u/M3uIptvProvider.kt` — Respect `channel.catchupType` & `catchupDays` in `resolveCatchup`
-```kotlin
-override suspend fun resolveCatchup(
-    channel: NormalizedChannel,
-    program: EpgProgram
-): Result<StreamDescriptor?> {
-    if (channel.catchupDays <= 0 || channel.catchupType.equals("NONE", ignoreCase = true)) {
-        return Result.success(null)
-    }
-    val nowMs = System.currentTimeMillis()
-    val retentionMs = channel.catchupDays.toLong() * 86_400_000L
-    if (program.startMs <= 0L || program.stopMs <= program.startMs || (nowMs - program.stopMs) >= retentionMs) {
-        return Result.success(null)
-    }
-
-    val endpoint = channel.endpoints.firstOrNull() ?: return Result.success(null)
-    val durationSec = (program.stopMs - program.startMs) / 1000L
-    if (durationSec <= 0L) return Result.success(null)
-
-    val mappedType = when (channel.catchupType.uppercase()) {
-        "FLUSSONIC" -> CatchupType.FLUSSONIC
-        "SHIFT" -> CatchupType.SHIFT
-        "APPEND" -> CatchupType.APPEND
-        "XC", "XTREAM" -> CatchupType.XTREAM
-        else -> CatchupType.DEFAULT
-    }
-
-    val metadata = CatchupMetadata(
-        channelId = 0L,
-        catchupType = mappedType,
-        days = channel.catchupDays,
-        sourceTemplate = channel.catchupSource
-    )
-
-    val resolvedUrl = CatchupUrlBuilder.buildCatchupUrl(
-        streamUrl = endpoint.url,
-        metadata = metadata,
-        startEpochMs = program.startMs,
-        durationSeconds = durationSec
-    )
-
-    val headers = buildMap {
-        endpoint.userAgent?.let { put("User-Agent", it) }
-        endpoint.referer?.let { put("Referer", it) }
-        endpoint.cookie?.let { put("Cookie", it) }
-        endpoint.authorization?.let { put("Authorization", it) }
-    }
-
-    return Result.success(
-        StreamDescriptor(
-            streamUri = resolvedUrl,
-            containerFormat = if (resolvedUrl.contains(".ts", ignoreCase = true)) "ts" else "m3u8",
-            headers = headers,
-            userAgent = endpoint.userAgent,
-            isLive = false
-        )
-    )
-}
-```
-
-#### `ui/epg/EpgProgramDetailsBottomSheet.kt` — Pre-validate catch-up descriptor before launching `MediaPlayerActivity`
-```kotlin
-private fun playCatchup(ch: Channel, prog: EpgProgram) {
-    lifecycleScope.launch {
-        val result = unifiedCatchupEngine.resolveCatchupDescriptor(ch.channelId, prog.startMs, prog.stopMs)
-        if (result.isFailure) {
-            Toast.makeText(
-                requireContext(),
-                result.exceptionOrNull()?.message ?: "Catch-up is unavailable for this program.",
-                Toast.LENGTH_LONG
-            ).show()
-            return@launch
-        }
-
-        val catchupId = "catchup_${ch.channelId}_${prog.startMs}_${prog.stopMs}"
-        val intent = Intent(requireContext(), MediaPlayerActivity::class.java).apply {
-            putExtra(MediaPlayerActivity.EXTRA_MEDIA_PATH, catchupId)
-            putExtra(MediaPlayerActivity.EXTRA_MEDIA_TITLE, "${ch.title}: ${prog.title}")
-            putExtra(MediaPlayerActivity.EXTRA_MEDIA_THUMBNAIL, ch.logoUrl)
-            putExtra("group_title", ch.groupTitle)
-            putExtra(MediaPlayerActivity.EXTRA_RESUME_POSITION, 0L)
-        }
-        startActivity(intent)
-        dismiss()
+    suspend fun resetAllOverrides() = withContext(Dispatchers.IO) {
+        AppLogger.w(TAG, "Resetting all user channel overrides to provider defaults")
+        overrideDao.deleteAll()
     }
 }
-```
+""",
 
----
+    "viewmodel/ChannelOrganizationViewModel.kt": """package vid.mat.app.viewmodel
 
-### Phase 8 Completion Notes
-- **Completed in code above**:
-  - Consolidated catch-up URL building and stream resolution under `UnifiedCatchupEngine`, wired into `StreamResolver` and `EpgProgramDetailsBottomSheet`.
-  - Fixed `CatchupUrlBuilder` for `FLUSSONIC` (`/timeshift_abs-<sec>.m3u8` / query preservation) and `XTREAM` (`/timeshift/` query preservation).
-  - Enforced `catchupDays` retention bounds, header preservation, credential injection, and `NetworkSecurityValidator` checks across Xtream and M3U catch-up.
-  - Updated `EpgProgramDetailsBottomSheet.playCatchup` to surface a clear toast error instead of opening a broken player screen when archive resolution fails.
-- **Orphaned file noted for Phase 16 cleanup**: `player/CatchupStreamResolver.kt` (references orphaned `ChannelEntity`, unused anywhere).
-
-Confirm when you are ready to proceed to **Phase 9 — VOD completion**.
-Below are **only the new or modified methods, attributes, and targeted edits** for **Phase 9 — VOD Completion**.
-
-*(No full classes are repeated.)*
-
----
-
-### 1. Compilation Fix & Source-Scoped Browsing (`ui/vod/VodDetailsActivity.kt`, `viewmodel/VodCatalogViewModel.kt`, `ui/vod/VodCatalogFragment.kt`)
-
-#### `ui/vod/VodDetailsActivity.kt` — Add missing imports & handle missing/unavailable movie cleanly
-```kotlin
-// Add missing imports at top of file:
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.launch
+import vid.mat.app.data.model.ChannelUserOverrideEntity
+import vid.mat.app.data.model.CustomGroupEntity
+import vid.mat.app.data.model.OrganizedChannel
+import vid.mat.app.data.repository.ChannelOrganizationRepository
 import javax.inject.Inject
-import vid.mat.app.security.ParentalGatekeeper
-import vid.mat.app.ui.security.ParentalPinChallengeDialog
-```
 
-#### `viewmodel/VodDetailsViewModel.kt` — Surface unavailable/deleted movie error & distinguish metadata load state
-```kotlin
-private val _loadError = MutableStateFlow<String?>(null)
-val loadError: StateFlow<String?> = _loadError.asStateFlow()
+@HiltViewModel
+class ChannelOrganizationViewModel @Inject constructor(
+    private val organizationRepo: ChannelOrganizationRepository
+) : ViewModel() {
 
-fun loadDetails() = viewModelScope.launch {
-    _isLoading.value = true
-    _loadError.value = null
-    val movie = vodRepository.getMovieById(movieId)
-    _movieState.value = movie
-    if (movie == null) {
-        _loadError.value = "This movie is no longer available in your catalog."
+    private val _organizedChannels = MutableStateFlow<List<OrganizedChannel>>(emptyList())
+    val organizedChannels: StateFlow<List<OrganizedChannel>> = _organizedChannels.asStateFlow()
+
+    private val _selectedGroup = MutableStateFlow<String?>(null)
+    val selectedGroup: StateFlow<String?> = _selectedGroup.asStateFlow()
+
+    private val _includeHidden = MutableStateFlow(false)
+    val includeHidden: StateFlow<Boolean> = _includeHidden.asStateFlow()
+
+    private val _isLoading = MutableStateFlow(false)
+    val isLoading: StateFlow<Boolean> = _isLoading.asStateFlow()
+
+    val customGroups: StateFlow<List<CustomGroupEntity>> = organizationRepo.customGroups
+        .stateIn(viewModelScope, SharingStarted.Lazily, emptyList())
+
+    init {
+        loadChannels()
+    }
+
+    fun loadChannels() = viewModelScope.launch {
+        _isLoading.value = true
+        _organizedChannels.value = organizationRepo.getOrganizedChannels(
+            groupFilter = _selectedGroup.value,
+            includeHidden = _includeHidden.value
+        )
         _isLoading.value = false
-        return@launch
     }
 
-    val updated = vodRepository.fetchAndCacheFullMovieDetails(movie).getOrDefault(movie)
-    _movieState.value = updated
-    val resolved = vodRepository.resolvePlayableUrl(updated)
-    _playableUrl.value = resolved
-    if (resolved == null) {
-        _loadError.value = "Movie stream credentials are unavailable."
+    fun selectGroup(group: String?) {
+        _selectedGroup.value = group
+        loadChannels()
     }
-    _isLoading.value = false
+
+    fun toggleIncludeHidden() {
+        _includeHidden.value = !_includeHidden.value
+        loadChannels()
+    }
+
+    fun moveChannel(fromPosition: Int, toPosition: Int) {
+        val currentList = _organizedChannels.value.toMutableList()
+        if (fromPosition in currentList.indices && toPosition in currentList.indices) {
+            val moved = currentList.removeAt(fromPosition)
+            currentList.add(toPosition, moved)
+            _organizedChannels.value = currentList
+        }
+    }
+
+    fun saveReorderedChannels() = viewModelScope.launch {
+        val current = _organizedChannels.value
+        val identities = current.map { it.channel.channelIdentity }
+        organizationRepo.reorderChannels(identities)
+        _organizedChannels.value = current.mapIndexed { idx, item ->
+            val updatedOverride = (item.override ?: ChannelUserOverrideEntity(
+                channelIdentity = item.channel.channelIdentity
+            )).copy(userOrderIndex = idx)
+            item.copy(override = updatedOverride)
+        }
+    }
+
+    fun saveChannelOverride(
+        channelIdentity: String,
+        title: String?,
+        group: String?,
+        logo: String?,
+        number: Int?
+    ) = viewModelScope.launch {
+        organizationRepo.saveChannelOverride(channelIdentity, title, group, logo, number)
+        loadChannels()
+    }
+
+    fun toggleHideChannel(channel: OrganizedChannel) = viewModelScope.launch {
+        organizationRepo.setChannelHidden(channel.channel.channelIdentity, !channel.isHidden)
+        loadChannels()
+    }
+
+    fun restoreOriginalChannel(channel: OrganizedChannel) = viewModelScope.launch {
+        organizationRepo.restoreOriginalChannel(channel.channel.channelIdentity)
+        loadChannels()
+    }
+
+    fun resetAllOverrides() = viewModelScope.launch {
+        organizationRepo.resetAllOverrides()
+        loadChannels()
+    }
+
+    fun createCustomGroup(name: String) = viewModelScope.launch {
+        organizationRepo.createCustomGroup(name)
+    }
+
+    fun deleteCustomGroup(name: String) = viewModelScope.launch {
+        organizationRepo.deleteCustomGroup(name)
+        if (_selectedGroup.value == name) {
+            _selectedGroup.value = null
+        }
+        loadChannels()
+    }
 }
-```
+""",
 
-#### `ui/vod/VodDetailsActivity.kt` — Observe `loadError` & show clear feedback when movie is missing/unavailable
-```kotlin
-// Inside observeMovieDetails():
-lifecycleScope.launch {
-    repeatOnLifecycle(Lifecycle.State.STARTED) {
-        viewModel.loadError.collect { err ->
-            if (!err.isNullOrBlank()) {
-                Toast.makeText(this@VodDetailsActivity, err, Toast.LENGTH_LONG).show()
-                if (viewModel.movieState.value == null) finish()
+    "ui/organization/ChannelOrganizationFragment.kt": """package vid.mat.app.ui.organization
+
+import android.os.Bundle
+import android.view.LayoutInflater
+import android.view.View
+import android.view.ViewGroup
+import androidx.fragment.app.Fragment
+import androidx.fragment.app.viewModels
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.repeatOnLifecycle
+import androidx.recyclerview.widget.ItemTouchHelper
+import androidx.recyclerview.widget.LinearLayoutManager
+import androidx.recyclerview.widget.RecyclerView
+import com.google.android.material.dialog.MaterialAlertDialogBuilder
+import dagger.hilt.android.AndroidEntryPoint
+import kotlinx.coroutines.launch
+import vid.mat.app.R
+import vid.mat.app.data.model.OrganizedChannel
+import vid.mat.app.databinding.FragmentChannelOrganizationBinding
+import vid.mat.app.databinding.ItemChannelOrganizeRowBinding
+import vid.mat.app.image.LogoImageLoader
+import vid.mat.app.viewmodel.ChannelOrganizationViewModel
+
+@AndroidEntryPoint
+class ChannelOrganizationFragment : Fragment() {
+
+    private var _binding: FragmentChannelOrganizationBinding? = null
+    private val binding get() = _binding!!
+    private val viewModel: ChannelOrganizationViewModel by viewModels()
+
+    private lateinit var organizeAdapter: ChannelOrganizeAdapter
+
+    override fun onCreateView(inflater: LayoutInflater, container: ViewGroup?, savedInstanceState: Bundle?): View {
+        _binding = FragmentChannelOrganizationBinding.inflate(inflater, container, false)
+        return binding.root
+    }
+
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        super.onViewCreated(view, savedInstanceState)
+        setupRecycler()
+        setupListeners()
+        observeData()
+    }
+
+    private fun setupRecycler() {
+        organizeAdapter = ChannelOrganizeAdapter(
+            onEdit = { channel -> showEditDialog(channel) },
+            onToggleHide = { channel -> viewModel.toggleHideChannel(channel) }
+        )
+
+        val touchHelper = ItemTouchHelper(object : ItemTouchHelper.SimpleCallback(
+            ItemTouchHelper.UP or ItemTouchHelper.DOWN, 0
+        ) {
+            override fun onMove(rv: RecyclerView, vh: RecyclerView.ViewHolder, target: RecyclerView.ViewHolder): Boolean {
+                viewModel.moveChannel(vh.adapterPosition, target.adapterPosition)
+                organizeAdapter.notifyItemMoved(vh.adapterPosition, target.adapterPosition)
+                return true
+            }
+
+            override fun onSwiped(vh: RecyclerView.ViewHolder, direction: Int) {}
+            override fun clearView(rv: RecyclerView, vh: RecyclerView.ViewHolder) {
+                super.clearView(rv, vh)
+                viewModel.saveReorderedChannels()
+            }
+        })
+
+        binding.rvChannels.apply {
+            layoutManager = LinearLayoutManager(requireContext())
+            adapter = organizeAdapter
+            touchHelper.attachToRecyclerView(this)
+        }
+    }
+
+    private fun setupListeners() {
+        binding.btnIncludeHidden.setOnCheckedChangeListener { _, _ ->
+            viewModel.toggleIncludeHidden()
+        }
+
+        binding.btnResetAll.setOnClickListener {
+            MaterialAlertDialogBuilder(requireContext())
+                .setTitle("Reset All Channel Overrides?")
+                .setMessage("This will remove all custom names, drag-and-drop orders, and custom channel numbers, restoring provider defaults.")
+                .setPositiveButton("Reset All") { _, _ -> viewModel.resetAllOverrides() }
+                .setNegativeButton("Cancel", null)
+                .show()
+        }
+    }
+
+    private fun observeData() {
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewLifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {
+                viewModel.organizedChannels.collect { channels ->
+                    organizeAdapter.items = channels
+                    organizeAdapter.notifyDataSetChanged()
+                }
             }
         }
     }
+
+    private fun showEditDialog(channel: OrganizedChannel) {
+        EditChannelOverrideDialogFragment.newInstance(
+            channel = channel,
+            onSave = { title, group, logo, num ->
+                viewModel.saveChannelOverride(channel.channel.channelIdentity, title, group, logo, num)
+            },
+            onReset = {
+                viewModel.restoreOriginalChannel(channel)
+            }
+        ).show(parentFragmentManager, EditChannelOverrideDialogFragment.TAG)
+    }
+
+    override fun onDestroyView() {
+        super.onDestroyView()
+        _binding = null
+    }
+
+    private class ChannelOrganizeAdapter(
+        private val onEdit: (OrganizedChannel) -> Unit,
+        private val onToggleHide: (OrganizedChannel) -> Unit
+    ) : RecyclerView.Adapter<ChannelOrganizeAdapter.VH>() {
+
+        var items: List<OrganizedChannel> = emptyList()
+
+        override fun getItemCount(): Int = items.size
+
+        override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): VH {
+            val binding = ItemChannelOrganizeRowBinding.inflate(LayoutInflater.from(parent.context), parent, false)
+            return VH(binding)
+        }
+
+        override fun onBindViewHolder(holder: VH, position: Int) {
+            val item = items[position]
+            holder.binding.tvNumber.text = item.displayNumber?.toString() ?: "#${position + 1}"
+            holder.binding.tvTitle.text = item.displayTitle
+            holder.binding.tvGroup.text = item.displayGroup
+
+            holder.binding.tvCustomBadge.visibility = if (item.hasOverride) View.VISIBLE else View.GONE
+            holder.binding.btnHide.setImageResource(
+                if (item.isHidden) R.drawable.ic_close else R.drawable.ic_notification
+            )
+
+            LogoImageLoader.load(
+                context = holder.binding.ivLogo.context,
+                title = item.displayTitle,
+                logoUrl = item.displayLogo,
+                target = holder.binding.ivLogo,
+                cornerDp = 6f
+            )
+
+            holder.binding.btnEdit.setOnClickListener { onEdit(item) }
+            holder.binding.btnHide.setOnClickListener { onToggleHide(item) }
+        }
+
+        class VH(val binding: ItemChannelOrganizeRowBinding) : RecyclerView.ViewHolder(binding.root)
+    }
 }
-```
+""",
 
----
+    "tv/TvChannelPresenter.kt": """package vid.mat.app.tv
 
-### 2. VOD Metadata, Credential Validation & Resume Progress (`data/repository/VodRepository.kt`, `viewmodel/VodCatalogViewModel.kt`, `ui/vod/VodCatalogFragment.kt`)
+import android.content.Context
+import android.view.ViewGroup
+import android.widget.ImageView
+import androidx.leanback.widget.ImageCardView
+import androidx.leanback.widget.Presenter
+import vid.mat.app.data.model.Channel
+import vid.mat.app.data.model.SeriesEntity
+import vid.mat.app.data.model.VideoUrl
+import vid.mat.app.data.model.VodMovieEntity
+import vid.mat.app.epg.EpgViewModel
+import vid.mat.app.history.WatchHistory
+import vid.mat.app.image.LogoImageLoader
+import vid.mat.app.search.model.SearchItem
+import vid.mat.app.util.performance.DeviceCapabilityProfile
 
-#### `data/repository/VodRepository.kt` — Validate credentials in `resolvePlayableUrl` & cache `year` / `country` / `youtubeTrailer`
-```kotlin
-// Inject XtreamAccountManager into constructor:
+class TvChannelPresenter(
+    private val epgViewModel: EpgViewModel? = null
+) : Presenter() {
+
+    companion object {
+        private const val CARD_WIDTH_DP = 220
+        private const val CARD_HEIGHT_DP = 124
+    }
+
+    override fun onCreateViewHolder(parent: ViewGroup): ViewHolder {
+        val isLowEnd = DeviceCapabilityProfile.isLowEndHardware(parent.context)
+        val card = ImageCardView(parent.context).apply {
+            isFocusable = true
+            isFocusableInTouchMode = true
+            setMainImageDimensions(
+                dpToPx(parent.context, if (isLowEnd) 180 else CARD_WIDTH_DP),
+                dpToPx(parent.context, if (isLowEnd) 100 else CARD_HEIGHT_DP)
+            )
+            setMainImageScaleType(ImageView.ScaleType.CENTER_CROP)
+        }
+        return ViewHolder(card)
+    }
+
+    override fun onBindViewHolder(viewHolder: ViewHolder, item: Any?) {
+        val card = viewHolder.view as ImageCardView
+
+        when (item) {
+            is Channel -> {
+                card.titleText = item.title
+                val epgText = item.tvgId?.let { tvgId ->
+                    val cached = epgViewModel?.getCachedNowNext(tvgId)
+                    if (cached != null && !cached.isEmpty) cached.toDisplayString()
+                    else {
+                        epgViewModel?.requestNowAndNext(tvgId)
+                        null
+                    }
+                }
+                card.contentText = epgText ?: item.groupTitle ?: ""
+                loadLogo(card, item.title, item.logoUrl)
+            }
+            is VideoUrl -> {
+                card.titleText = item.title
+                card.contentText = epgSubtitle(item)
+                loadLogo(card, item.title, item.logoUrl)
+            }
+            is WatchHistory -> {
+                card.titleText = item.title
+                card.contentText = "${item.completedPercent}% watched"
+                loadLogo(card, item.title, item.logoUrl)
+            }
+            is VodMovieEntity -> {
+                card.titleText = item.title
+                card.contentText = item.year ?: item.categoryName
+                loadLogo(card, item.title, item.posterUrl ?: item.backdropUrl)
+            }
+            is SeriesEntity -> {
+                card.titleText = item.title
+                card.contentText = item.categoryName
+                loadLogo(card, item.title, item.coverUrl ?: item.backdropUrl)
+            }
+            is SearchItem -> {
+                card.titleText = item.title
+                card.contentText = item.subtitle ?: item.groupTitle ?: ""
+                loadLogo(card, item.title, item.logoUrl)
+            }
+        }
+    }
+
+    override fun onUnbindViewHolder(viewHolder: ViewHolder) {
+        val card = viewHolder.view as ImageCardView
+        card.mainImageView?.setImageDrawable(null)
+        card.badgeImage = null
+    }
+
+    private fun loadLogo(card: ImageCardView, title: String, logoUrl: String?) {
+        val imageView = card.mainImageView ?: return
+        LogoImageLoader.load(
+            context = imageView.context,
+            title = title,
+            logoUrl = logoUrl,
+            target = imageView,
+            cornerDp = 8f
+        )
+    }
+
+    private fun epgSubtitle(channel: VideoUrl): String {
+        val tvgId = channel.tvgId ?: return ""
+        val cached = epgViewModel?.getCachedNowNext(tvgId)
+        if (cached != null && !cached.isEmpty) return cached.toDisplayString()
+        epgViewModel?.requestNowAndNext(tvgId)
+        return ""
+    }
+
+    private fun dpToPx(context: Context, dp: Int): Int =
+        (dp * context.resources.displayMetrics.density).toInt()
+}
+""",
+
+    "data/repository/VodRepository.kt": """package vid.mat.app.data.repository
+
+import androidx.paging.Pager
+import androidx.paging.PagingConfig
+import androidx.paging.PagingData
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.withContext
+import vid.mat.app.data.dao.VodMovieDao
+import vid.mat.app.data.model.VodCategoryEntity
+import vid.mat.app.data.model.VodMovieEntity
+import vid.mat.app.favorites.FavoriteTargetIds
+import vid.mat.app.favorites.UnifiedFavoriteRepository
+import vid.mat.app.favorites.model.FavoriteType
+import vid.mat.app.provider.IptvProviderFactory
+import vid.mat.app.security.XtreamAccountManager
+import vid.mat.app.util.AppLogger
+import javax.inject.Inject
+import javax.inject.Singleton
+
 @Singleton
 class VodRepository @Inject constructor(
     private val vodDao: VodMovieDao,
     private val playlistSourceRepository: PlaylistSourceRepository,
     private val providerFactory: IptvProviderFactory,
     private val favoriteRepository: UnifiedFavoriteRepository,
-    private val xtreamAccountManager: vid.mat.app.security.XtreamAccountManager
+    private val xtreamAccountManager: XtreamAccountManager
 ) {
-    suspend fun resolvePlayableUrl(movie: VodMovieEntity): String? {
-        val creds = xtreamAccountManager.resolveCredentials(movie.accountId)
-        if (creds !is vid.mat.app.security.XtreamAccountManager.CredentialsResolution.Success) {
-            return null
-        }
-        return "vod_${movie.id}"
+    companion object {
+        private const val TAG = "VodRepository"
+        const val PAGE_SIZE = 30
+        const val PREFETCH = 60
+    }
+
+    val continueWatching: Flow<List<VodMovieEntity>> = vodDao.getContinueWatching()
+    val favorites: Flow<List<VodMovieEntity>> = vodDao.getFavorites()
+
+    fun getPagedMovies(
+        sourceId: Long? = null,
+        categoryId: String? = null,
+        query: String = "",
+        sortMode: Int = 0,
+        favOnly: Boolean = false
+    ): Flow<PagingData<VodMovieEntity>> = Pager(
+        config = PagingConfig(pageSize = PAGE_SIZE, prefetchDistance = PREFETCH, enablePlaceholders = false),
+        pagingSourceFactory = { vodDao.getPagedMovies(sourceId, categoryId, query, sortMode, favOnly) }
+    ).flow
+
+    fun getCategories(sourceId: Long? = null): Flow<List<VodCategoryEntity>> = vodDao.getDistinctCategories(sourceId)
+
+    fun countMovies(sourceId: Long? = null): Flow<Int> = vodDao.countMovies(sourceId)
+
+    suspend fun getMoviesByCategory(sourceId: Long?, categoryId: String, limit: Int = 25): List<VodMovieEntity> =
+        vodDao.getMoviesByCategory(sourceId, categoryId, limit)
+
+    suspend fun getMovieById(movieId: Long): VodMovieEntity? = vodDao.getById(movieId)
+
+    suspend fun toggleFavorite(movie: VodMovieEntity) {
+        favoriteRepository.toggleFavorite(
+            targetId = FavoriteTargetIds.movie(movie.id),
+            type = FavoriteType.VOD_MOVIE,
+            title = movie.title,
+            subtitle = movie.year,
+            logoUrl = movie.posterUrl,
+            streamUrl = "vod_${movie.id}",
+            groupTitle = movie.categoryName
+        )
+    }
+
+    suspend fun updateWatchProgress(movieId: Long, positionMs: Long, durationMs: Long) {
+        val percent = if (durationMs > 0L) ((positionMs.toDouble() / durationMs) * 100).toInt().coerceIn(0, 100) else 0
+        vodDao.updateWatchProgress(movieId, positionMs, durationMs, percent, System.currentTimeMillis())
     }
 
     suspend fun fetchAndCacheFullMovieDetails(movie: VodMovieEntity): Result<VodMovieEntity> = withContext(Dispatchers.IO) {
@@ -1000,1727 +640,1319 @@ class VodRepository @Inject constructor(
             Result.success(movie)
         }
     }
-}
-```
 
-#### `viewmodel/VodCatalogViewModel.kt` — Respect active source filter (`UnifiedCatalogRepository.activeSourceFilter`) & reset category on source switch
-```kotlin
-// Inject UnifiedCatalogRepository to scope VOD categories & movies to active source filter:
-@OptIn(ExperimentalCoroutinesApi::class)
-@HiltViewModel
-class VodCatalogViewModel @Inject constructor(
-    private val vodRepository: VodRepository,
-    private val catalogRepository: vid.mat.app.data.repository.UnifiedCatalogRepository
-) : ViewModel() {
-
-    val categories: StateFlow<List<VodCategoryEntity>> = catalogRepository.activeSourceFilter
-        .flatMapLatest { sourceId ->
-            _selectedCategoryId.value = null
-            vodRepository.getCategories(sourceId)
+    suspend fun resolvePlayableUrl(movie: VodMovieEntity): String? {
+        val creds = xtreamAccountManager.resolveCredentials(movie.accountId)
+        if (creds !is XtreamAccountManager.CredentialsResolution.Success) {
+            return null
         }
-        .stateIn(viewModelScope, SharingStarted.Lazily, emptyList())
-
-    val totalMoviesCount: StateFlow<Int> = catalogRepository.activeSourceFilter
-        .flatMapLatest { sourceId -> vodRepository.countMovies(sourceId) }
-        .stateIn(viewModelScope, SharingStarted.Lazily, 0)
-
-    val pagedMovies: Flow<PagingData<VodMovieEntity>> = combine(
-        catalogRepository.activeSourceFilter,
-        _searchQuery,
-        _selectedCategoryId,
-        _sortMode,
-        _favOnly
-    ) { sourceId, q, cat, sort, fav ->
-        Params(sourceId, q, cat, sort, fav)
-    }.flatMapLatest { p ->
-        vodRepository.getPagedMovies(
-            sourceId = p.sourceId,
-            categoryId = p.category,
-            query = p.query,
-            sortMode = p.sort,
-            favOnly = p.fav
-        )
-    }.cachedIn(viewModelScope)
-
-    private data class Params(
-        val sourceId: Long?,
-        val query: String,
-        val category: String?,
-        val sort: Int,
-        val fav: Boolean
-    )
-}
-```
-
-#### `ui/vod/VodCatalogFragment.kt` — Handle `PagingDataAdapter` loading/empty/error states & refresh on resume
-```kotlin
-// Inside setupRecyclerView():
-viewLifecycleOwner.lifecycleScope.launch {
-    movieAdapter.loadStateFlow.collectLatest { loadState ->
-        val isEmpty = loadState.refresh is androidx.paging.LoadState.NotLoading && movieAdapter.itemCount == 0
-        binding.rvMovies.visibility = if (isEmpty) View.GONE else View.VISIBLE
+        return "vod_${movie.id}"
     }
 }
-
-// Refresh visible items when returning from VodDetailsActivity / MediaPlayerActivity
-// so updated resume progress bars & favorite icons render immediately:
-override fun onResume() {
-    super.onResume()
-    if (::movieAdapter.isInitialized) {
-        movieAdapter.refresh()
-    }
+"""
 }
+
+
+def main() -> None:
+    if not BASE_DIR.exists():
+        raise SystemExit(f"Target directory does not exist: {BASE_DIR}")
+
+    for rel_path, content in FILES.items():
+        target = BASE_DIR / rel_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+        print(f"Updated: {target}")
+
+    print(f"Done. Wrote {len(FILES)} files.")
+
+
+if __name__ == "__main__":
+    main()
 ```
 
-#### `ui/vod/VodDetailsActivity.kt` — Refresh resume state upon returning from `MediaPlayerActivity`
-```kotlin
-override fun onResume() {
-    super.onResume()
-    viewModel.loadDetails()
-}
-```
+May I proceed with **Batch 6 (5 classes — Android TV Browse & Search)** (`data/repository/SeriesRepository.kt`, `tv/TvVodBrowseFragment.kt`, `tv/TvSeriesBrowseFragment.kt`, `tv/TvSearchFragment.kt`, `tv/TvBrowseFragment.kt`)?
 
----
+Here is the Python script for **Batch 6 (5 classes — Android TV Browse & Search)**:
 
-### Phase 9 Completion Notes
-- **Completed in code above**:
-  - Fixed compilation errors in `VodDetailsActivity.kt` (missing `Inject`, `ParentalGatekeeper`, `ParentalPinChallengeDialog` imports).
-  - `VodDetailsViewModel` & `VodDetailsActivity` now detect missing/deleted movies and unavailable credentials (`loadError`) and refresh resume state on `onResume()` after playback.
-  - `VodRepository.resolvePlayableUrl` validates Xtream credentials before advertising a playable pseudo-URL; `fetchAndCacheFullMovieDetails` preserves existing non-empty fields and propagates `CancellationException`.
-  - `VodCatalogViewModel` scopes categories, counts, and paged movies to `UnifiedCatalogRepository.activeSourceFilter` and resets stale category selection when sources switch.
-  - `VodCatalogFragment` observes `loadStateFlow` for empty visibility and refreshes progress/favorites on `onResume()`.
-- **Confirmed already intact**: `UnifiedCatalogRepository.reconcileMoviesNonDestructively` skips deletion/overwrite whenever `catalog.isMoviesFetched == false` (preserving existing movies after provider failures).
+1. `data/repository/SeriesRepository.kt` — Exposes `getSeriesByCategory(...)` for Android TV category rows.
+2. `tv/TvVodBrowseFragment.kt` — Populates VOD category rows from `vodRepository.getMoviesByCategory(...)` and enforces `ParentalGatekeeper`.
+3. `tv/TvSeriesBrowseFragment.kt` — Populates Series category rows from `seriesRepository.getSeriesByCategory(...)` and enforces `ParentalGatekeeper`.
+4. `tv/TvSearchFragment.kt` — Routes `LiveChannelItem` by `channelIdentity`, `VodMovieItem` to `VodDetailsActivity`, and `SeriesItem` to `SeriesDetailsActivity`.
+5. `tv/TvBrowseFragment.kt` — Applies `ChannelOrganizationRepository` overrides, `ParentalGatekeeper` filtering, and `TvFocusCoordinator` focus restoration.
 
-Confirm when you are ready to proceed to **Phase 10 — Series and episode completion**.
-Below are **only the new or modified methods, attributes, and targeted edits** for **Phase 10 — Series and Episode Completion**.
+```python
+#!/usr/bin/env python3
+from pathlib import Path
 
-*(No full classes are repeated.)*
+BASE_DIR = Path("/home/username/AndroidStudioProjects/Ytvmate/app/src/main/java/vid/mat/app")
 
----
+FILES = {
+    "data/repository/SeriesRepository.kt": """package vid.mat.app.data.repository
 
-### 1. Compilation & Safe Non-Destructive Episode Persistence (`ui/series/SeriesDetailsActivity.kt`, `data/dao/SeriesDao.kt`, `data/repository/SeriesRepository.kt`)
-
-#### `ui/series/SeriesDetailsActivity.kt` — Add missing imports & refresh details on return from playback
-```kotlin
-// Add missing imports at top of file:
+import androidx.paging.Pager
+import androidx.paging.PagingConfig
+import androidx.paging.PagingData
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.withContext
+import vid.mat.app.data.dao.SeriesDao
+import vid.mat.app.data.model.EpisodeEntity
+import vid.mat.app.data.model.SeasonEntity
+import vid.mat.app.data.model.SeriesCategoryEntity
+import vid.mat.app.data.model.SeriesEntity
+import vid.mat.app.favorites.FavoriteTargetIds
+import vid.mat.app.favorites.UnifiedFavoriteRepository
+import vid.mat.app.favorites.model.FavoriteType
+import vid.mat.app.provider.IptvProviderFactory
+import vid.mat.app.security.XtreamAccountManager
+import vid.mat.app.util.AppLogger
 import javax.inject.Inject
-import vid.mat.app.security.ParentalGatekeeper
-import vid.mat.app.ui.security.ParentalPinChallengeDialog
+import javax.inject.Singleton
 
-override fun onResume() {
-    super.onResume()
-    viewModel.loadDetails()
-}
-```
-
-#### `data/dao/SeriesDao.kt` — Non-destructive episode query & batch update so existing watch progress is preserved across metadata refreshes
-```kotlin
-@Query("SELECT * FROM series_episodes WHERE seriesDbId = :seriesDbId")
-suspend fun getAllEpisodesForSeries(seriesDbId: Long): List<EpisodeEntity>
-
-@Update
-suspend fun updateEpisodes(episodes: List<EpisodeEntity>)
-
-@Query("DELETE FROM series_episodes WHERE seriesDbId = :seriesDbId AND id IN (:episodeIds)")
-suspend fun deleteEpisodesByIds(seriesDbId: Long, episodeIds: List<Long>)
-```
-
-#### `data/repository/SeriesRepository.kt` — Preserve episode watch progress on refresh, reconcile dropped episodes safely, & validate credentials
-```kotlin
-suspend fun fetchAndCacheFullSeriesDetails(series: SeriesEntity): Result<SeriesEntity> = withContext(Dispatchers.IO) {
-    try {
-        val source = playlistSourceRepository.getSource(series.sourceId)
-            ?: return@withContext Result.failure(IllegalStateException("Provider source not found for series"))
-        val provider = providerFactory.createProvider(source)
-        val details = provider.fetchSeriesDetails(series.seriesId).getOrThrow()
-        val seasonsList = details.seasons
-        val episodesMap = details.episodes
-
-        val updatedSeries = series.copy(
-            plot = details.plot?.takeIf { it.isNotBlank() } ?: series.plot,
-            cast = details.cast?.takeIf { it.isNotBlank() } ?: series.cast,
-            director = details.director?.takeIf { it.isNotBlank() } ?: series.director,
-            genre = details.genre?.takeIf { it.isNotBlank() } ?: series.genre,
-            rating = details.rating?.takeIf { it.isNotBlank() } ?: series.rating,
-            rating5Based = details.rating?.toFloatOrNull()?.let { it / 2f } ?: series.rating5Based,
-            backdropUrl = details.coverUrl?.takeIf { it.isNotBlank() } ?: series.backdropUrl,
-            totalSeasons = if (seasonsList.isNotEmpty()) seasonsList.size else episodesMap.keys.size,
-            hasFullDetailsLoaded = true
-        )
-        seriesDao.update(updatedSeries)
-
-        val seasonEntities = if (seasonsList.isNotEmpty()) {
-            seasonsList.map { s ->
-                SeasonEntity(
-                    seriesDbId = series.id,
-                    seriesId = series.seriesId,
-                    seasonNumber = s.seasonNumber,
-                    name = s.name.ifBlank { "Season ${s.seasonNumber}" },
-                    airDate = s.airDate,
-                    episodeCount = s.episodeCount,
-                    coverUrl = s.coverUrl,
-                    overview = s.overview
-                )
-            }
-        } else {
-            // Synthesize seasons if provider omitted the `seasons` array but returned `episodes` map
-            episodesMap.keys.mapNotNull { it.toIntOrNull() }.sorted().map { seasonNum ->
-                SeasonEntity(
-                    seriesDbId = series.id,
-                    seriesId = series.seriesId,
-                    seasonNumber = seasonNum,
-                    name = "Season $seasonNum",
-                    episodeCount = episodesMap[seasonNum.toString()]?.size ?: 0
-                )
-            }
-        }
-        if (seasonEntities.isNotEmpty()) {
-            seriesDao.insertSeasons(seasonEntities)
-        }
-
-        // Reconcile episodes non-destructively: preserve resumePositionMs, durationMs, completedPercent, isWatched
-        val existingEpisodes = seriesDao.getAllEpisodesForSeries(series.id)
-            .associateBy { it.seasonNumber to it.episodeNum }
-        val seenKeys = HashSet<Pair<Int, Int>>()
-        val toInsert = mutableListOf<EpisodeEntity>()
-        val toUpdate = mutableListOf<EpisodeEntity>()
-
-        episodesMap.forEach { (seasonNumStr, epList) ->
-            val seasonNum = seasonNumStr.toIntOrNull() ?: 1
-            epList.forEach { ep ->
-                val key = seasonNum to ep.episodeNumber
-                if (!seenKeys.add(key)) return@forEach
-                val existing = existingEpisodes[key]
-                if (existing == null) {
-                    toInsert.add(
-                        EpisodeEntity(
-                            seriesDbId = series.id,
-                            seriesId = series.seriesId,
-                            episodeIdStr = ep.id,
-                            seasonNumber = seasonNum,
-                            episodeNum = ep.episodeNumber,
-                            title = ep.title.ifBlank { "Episode ${ep.episodeNumber}" },
-                            containerExtension = ep.containerExtension?.ifBlank { "mp4" } ?: "mp4",
-                            durationSecs = ep.durationSecs ?: 0L,
-                            plot = ep.plot,
-                            movieImage = ep.movieImage,
-                            directSource = ep.directSource,
-                            customSid = ep.customSid
-                        )
-                    )
-                } else {
-                    toUpdate.add(
-                        existing.copy(
-                            episodeIdStr = ep.id.ifBlank { existing.episodeIdStr },
-                            title = ep.title.ifBlank { existing.title },
-                            containerExtension = ep.containerExtension?.ifBlank { existing.containerExtension } ?: existing.containerExtension,
-                            durationSecs = ep.durationSecs?.takeIf { it > 0L } ?: existing.durationSecs,
-                            plot = ep.plot?.takeIf { it.isNotBlank() } ?: existing.plot,
-                            movieImage = ep.movieImage?.takeIf { it.isNotBlank() } ?: existing.movieImage,
-                            directSource = ep.directSource?.takeIf { it.isNotBlank() } ?: existing.directSource,
-                            customSid = ep.customSid ?: existing.customSid
-                        )
-                    )
-                }
-            }
-        }
-
-        if (toInsert.isNotEmpty()) seriesDao.insertEpisodes(toInsert)
-        if (toUpdate.isNotEmpty()) seriesDao.updateEpisodes(toUpdate)
-
-        // Remove episodes deleted by provider only when episode map was non-empty
-        if (seenKeys.isNotEmpty()) {
-            val droppedIds = existingEpisodes.filterKeys { it !in seenKeys }.values.map { it.id }
-            if (droppedIds.isNotEmpty()) {
-                droppedIds.chunked(250).forEach { seriesDao.deleteEpisodesByIds(series.id, it) }
-            }
-        }
-
-        AppLogger.i(TAG, "Cached ${seasonEntities.size} seasons (${toInsert.size} new, ${toUpdate.size} updated episodes) for ${series.title}")
-        Result.success(updatedSeries)
-    } catch (e: kotlinx.coroutines.CancellationException) {
-        throw e
-    } catch (e: Exception) {
-        AppLogger.w(TAG, "Failed fetching deep series metadata: ${e.message}")
-        Result.success(series)
-    }
-}
-
-suspend fun getEpisodeById(episodeId: Long): EpisodeEntity? = seriesDao.getEpisodeById(episodeId)
-
-suspend fun resolvePlayableEpisodeUrl(series: SeriesEntity, episode: EpisodeEntity): String? {
-    if (!episode.directSource.isNullOrBlank()) return "series_${episode.id}"
-    val creds = xtreamAccountManager.resolveCredentials(series.accountId)
-    if (creds !is XtreamAccountManager.CredentialsResolution.Success) return null
-    return "series_${episode.id}"
-}
-```
-
----
-
-### 2. Catalog Filtering, Details Error State & Autoplay Integration (`SeriesCatalogViewModel.kt`, `SeriesDetailsViewModel.kt`, `SeriesCatalogFragment.kt`, `MediaPlayerActivity.kt`)
-
-#### `viewmodel/SeriesCatalogViewModel.kt` — Scope series & categories to `UnifiedCatalogRepository.activeSourceFilter`
-```kotlin
-@OptIn(ExperimentalCoroutinesApi::class)
-@HiltViewModel
-class SeriesCatalogViewModel @Inject constructor(
-    private val seriesRepository: SeriesRepository,
-    private val catalogRepository: vid.mat.app.data.repository.UnifiedCatalogRepository
-) : ViewModel() {
-
-    val categories: StateFlow<List<SeriesCategoryEntity>> = catalogRepository.activeSourceFilter
-        .flatMapLatest { sourceId ->
-            _selectedCategoryId.value = null
-            seriesRepository.getCategories(sourceId)
-        }
-        .stateIn(viewModelScope, SharingStarted.Lazily, emptyList())
-
-    val totalSeriesCount: StateFlow<Int> = catalogRepository.activeSourceFilter
-        .flatMapLatest { sourceId -> seriesRepository.countSeries(sourceId) }
-        .stateIn(viewModelScope, SharingStarted.Lazily, 0)
-
-    val pagedSeries: Flow<PagingData<SeriesEntity>> = combine(
-        catalogRepository.activeSourceFilter,
-        _searchQuery,
-        _selectedCategoryId,
-        _sortMode,
-        _favOnly
-    ) { sourceId, q, cat, sort, fav ->
-        Params(sourceId, q, cat, sort, fav)
-    }.flatMapLatest { p ->
-        seriesRepository.getPagedSeries(
-            sourceId = p.sourceId,
-            categoryId = p.category,
-            query = p.query,
-            sortMode = p.sort,
-            favOnly = p.fav
-        )
-    }.cachedIn(viewModelScope)
-
-    private data class Params(
-        val sourceId: Long?,
-        val query: String,
-        val category: String?,
-        val sort: Int,
-        val fav: Boolean
-    )
-}
-```
-
-#### `viewmodel/SeriesDetailsViewModel.kt` — Missing-series error handling & preserve selected season across `onResume()` reloads
-```kotlin
-private val _loadError = MutableStateFlow<String?>(null)
-val loadError: StateFlow<String?> = _loadError.asStateFlow()
-private var hasInitialSeasonLoaded = false
-
-fun loadDetails() = viewModelScope.launch {
-    _isLoading.value = true
-    _loadError.value = null
-    val series = seriesRepository.getSeriesById(seriesId)
-    _seriesState.value = series
-    if (series == null) {
-        _loadError.value = "This series is no longer available in your catalog."
-        _isLoading.value = false
-        return@launch
-    }
-
-    val updated = seriesRepository.fetchAndCacheFullSeriesDetails(series).getOrDefault(series)
-    _seriesState.value = updated
-
-    val seasonsList = seriesRepository.getSeasons(updated.id)
-    _seasons.value = seasonsList
-
-    val targetSeason = if (hasInitialSeasonLoaded) {
-        _selectedSeasonNumber.value
-    } else {
-        hasInitialSeasonLoaded = true
-        val preferred = updated.lastWatchedSeasonNumber.coerceAtLeast(1)
-        if (seasonsList.any { it.seasonNumber == preferred }) preferred
-        else seasonsList.firstOrNull()?.seasonNumber ?: 1
-    }
-    _selectedSeasonNumber.value = targetSeason
-    loadEpisodesForSeason(targetSeason)
-    _isLoading.value = false
-}
-```
-
-#### `ui/series/SeriesDetailsActivity.kt` — Select the active season tab matching `selectedSeasonNumber` & observe `loadError`
-```kotlin
-// Inside observeData():
-lifecycleScope.launch {
-    repeatOnLifecycle(Lifecycle.State.STARTED) {
-        viewModel.loadError.collect { err ->
-            if (!err.isNullOrBlank()) {
-                Toast.makeText(this@SeriesDetailsActivity, err, Toast.LENGTH_LONG).show()
-                if (viewModel.seriesState.value == null) finish()
-            }
-        }
-    }
-}
-
-// Replace seasons collector to select matching Tab without overwriting user's active tab on refresh:
-lifecycleScope.launch {
-    repeatOnLifecycle(Lifecycle.State.STARTED) {
-        viewModel.seasons.collect { seasons ->
-            binding.tabLayoutSeasons.removeAllTabs()
-            val selectedNum = viewModel.selectedSeasonNumber.value
-            var selectedTabIdx = 0
-            seasons.forEachIndexed { idx, season ->
-                if (season.seasonNumber == selectedNum) selectedTabIdx = idx
-                val tab = binding.tabLayoutSeasons.newTab().apply {
-                    text = season.name
-                    tag = season.seasonNumber
-                }
-                binding.tabLayoutSeasons.addTab(tab, false)
-            }
-            binding.tabLayoutSeasons.getTabAt(selectedTabIdx)?.select()
-        }
-    }
-}
-```
-
-#### `ui/series/SeriesCatalogFragment.kt` — Refresh progress/favorites on `onResume()` & handle empty state
-```kotlin
-override fun onResume() {
-    super.onResume()
-    if (::seriesAdapter.isInitialized) {
-        seriesAdapter.refresh()
-    }
-}
-```
-
-#### `series/autoplay/SeriesAutoplayManager.kt` & `ui/MediaPlayerActivity.kt` — Connect next-episode autoplay
-```kotlin
-// In MediaPlayerActivity.kt:
-// Add injected dependencies:
-@Inject
-lateinit var seriesAutoplayManager: vid.mat.app.series.autoplay.SeriesAutoplayManager
-
-@Inject
-lateinit var seriesRepository: vid.mat.app.data.repository.SeriesRepository
-
-private var nextEpisodeOverlayController: NextEpisodeOverlayController? = null
-
-// Add helper method called from loadDataAndStart(...) and observeViewModel():
-private fun configureSeriesAutoplay(mediaData: PlayerMediaData) {
-    if (!mediaData.mediaPath.startsWith("series_")) {
-        seriesAutoplayManager.reset()
-        return
-    }
-    if (nextEpisodeOverlayController == null) {
-        nextEpisodeOverlayController = NextEpisodeOverlayController(
-            activity = this,
-            rootContainer = binding.root as android.view.ViewGroup,
-            autoplayManager = seriesAutoplayManager,
-            viewModel = viewModel,
-            onSwitchEpisode = { nextEp, nextUrl ->
-                val seriesTitle = currentMediaData?.mediaTitle?.substringBefore(" - S") ?: "Series"
-                val nextTitle = "$seriesTitle - S${nextEp.seasonNumber}:E${nextEp.episodeNum} ${nextEp.title}"
-                val nextData = PlayerMediaData(
-                    mediaPath = nextUrl,
-                    mediaTitle = nextTitle,
-                    thumbnailUrl = nextEp.movieImage ?: currentMediaData?.thumbnailUrl.orEmpty(),
-                    resumePosition = nextEp.resumePositionMs,
-                    groupTitle = currentMediaData?.groupTitle
-                )
-                currentMediaData = nextData
-                binding.titleText.text = nextTitle
-                lifecycleCoordinator.startPlaybackService(nextData)
-                configureSeriesAutoplay(nextData)
-            }
-        ).apply { attach() }
-    }
-
-    val episodeDbId = mediaData.mediaPath.removePrefix("series_").toLongOrNull() ?: return
-    lifecycleScope.launch {
-        val ep = seriesRepository.getEpisodeById(episodeDbId) ?: return@launch
-        val series = seriesRepository.getSeriesById(ep.seriesDbId) ?: return@launch
-        seriesAutoplayManager.setActiveEpisode(
-            vid.mat.app.series.autoplay.model.ActiveEpisodePlaybackInfo(
-                seriesDbId = series.id,
-                seriesTitle = series.title,
-                seasonNumber = ep.seasonNumber,
-                episodeNumber = ep.episodeNum,
-                currentEpisodeId = ep.episodeIdStr
-            )
-        )
-    }
-}
-
-// Inside MediaPlayerActivity.observeViewModel() uiState collector:
-if (state.isPlaying && state.durationInMs > 0L && currentMediaData?.mediaPath?.startsWith("series_") == true) {
-    seriesAutoplayManager.onPlaybackPositionChanged(state.playbackPositionInMs, state.durationInMs) { nextEp, nextUrl ->
-        val seriesTitle = currentMediaData?.mediaTitle?.substringBefore(" - S") ?: "Series"
-        val nextTitle = "$seriesTitle - S${nextEp.seasonNumber}:E${nextEp.episodeNum} ${nextEp.title}"
-        val nextData = PlayerMediaData(
-            mediaPath = nextUrl,
-            mediaTitle = nextTitle,
-            thumbnailUrl = nextEp.movieImage ?: currentMediaData?.thumbnailUrl.orEmpty(),
-            resumePosition = nextEp.resumePositionMs,
-            groupTitle = currentMediaData?.groupTitle
-        )
-        currentMediaData = nextData
-        binding.titleText.text = nextTitle
-        lifecycleCoordinator.startPlaybackService(nextData)
-        configureSeriesAutoplay(nextData)
-    }
-}
-
-// Call configureSeriesAutoplay(data) at the end of MediaPlayerActivity.loadDataAndStart(...),
-// and seriesAutoplayManager.reset() inside MediaPlayerActivity.onDestroy() when isFinishing.
-```
-
----
-
-### Phase 10 Completion Notes
-- **Completed in code above**:
-  - Fixed compilation errors in `SeriesDetailsActivity.kt` (missing `Inject`, `ParentalGatekeeper`, `ParentalPinChallengeDialog` imports).
-  - Updated `SeriesRepository.fetchAndCacheFullSeriesDetails` + `SeriesDao` to reconcile episodes non-destructively (preserving `resumePositionMs`, `durationMs`, `completedPercent`, and `isWatched`), synthesize seasons when omitted by a provider, and safely remove deleted episodes.
-  - Scoped `SeriesCatalogViewModel` to `UnifiedCatalogRepository.activeSourceFilter`.
-  - Added missing-series `loadError` handling and active-season preservation across `onResume()` in `SeriesDetailsViewModel` & `SeriesDetailsActivity`.
-  - Connected `SeriesAutoplayManager` and `NextEpisodeOverlayController` into `MediaPlayerActivity` for automatic next-episode countdown and seamless transition.
-
-Confirm when you are ready to proceed to **Phase 11 — Watch history, progress, favorites, and profiles**.
-Below are **only the new or modified methods, attributes, and targeted edits** for **Phase 11 — Watch History, Progress, Favorites, and Profiles**.
-
-*(No full classes are repeated.)*
-
----
-
-### 1. Profile Initialization Race, Default Synchronization & PIN Creation (`ActiveProfileProvider.kt`, `ProfileRepository.kt`, `ProfileSelectionActivity.kt`, `ProfileSelectionViewModel.kt`)
-
-#### `profile/ActiveProfileProvider.kt` — Synchronous ready signal & default-flag integrity
-```kotlin
-private val _isProfileInitialized = kotlinx.coroutines.flow.MutableStateFlow(false)
-val isProfileInitialized: StateFlow<Boolean> = _isProfileInitialized.asStateFlow()
-
-private val initializationDeferred = kotlinx.coroutines.CompletableDeferred<Profile>()
-
-suspend fun awaitInitializedProfile(): Profile = initializationDeferred.await()
-
-init {
-    scope.launch {
-        try {
-            ensureDefaultProfile()
-            val savedId = prefs.getLong(KEY_ACTIVE_PROFILE_ID, 1L)
-            val profileEntity = profileDao.getById(savedId) ?: profileDao.getAllProfiles().firstOrNull()
-            if (profileEntity != null) {
-                val profile = profileEntity.toDomain()
-                prefs.edit { putLong(KEY_ACTIVE_PROFILE_ID, profile.id) }
-                _activeProfile.value = profile
-                favoriteSynchronizer.syncProfile(profile.id)
-                initializationDeferred.complete(profile)
-            } else {
-                initializationDeferred.complete(_activeProfile.value)
-            }
-        } catch (e: Exception) {
-            AppLogger.e(TAG, "Failed initializing active profile", e)
-            if (!initializationDeferred.isCompleted) {
-                initializationDeferred.complete(_activeProfile.value)
-            }
-        } finally {
-            _isProfileInitialized.value = true
-        }
-    }
-}
-
-suspend fun switchProfile(profileId: Long): Boolean {
-    awaitInitializedProfile()
-    val entity = profileDao.getById(profileId) ?: return false
-    prefs.edit { putLong(KEY_ACTIVE_PROFILE_ID, profileId) }
-    _activeProfile.value = entity.toDomain()
-    favoriteSynchronizer.syncProfile(entity.id)
-    AppLogger.i(TAG, "Switched active profile to '${entity.name}' (ID: ${entity.id})")
-    return true
-}
-```
-
-#### `profile/ProfileRepository.kt` — Prevent deleting the final remaining profile & clean up profile-scoped data on delete
-```kotlin
-// Inject FavoriteDao & WatchProgressDao & WatchHistoryDao to purge profile data on deletion:
 @Singleton
-class ProfileRepository @Inject constructor(
-    private val profileDao: ProfileDao,
-    private val activeProfileProvider: ActiveProfileProvider,
-    private val favoriteDao: vid.mat.app.favorites.dao.UnifiedFavoriteDao,
-    private val watchProgressDao: vid.mat.app.data.dao.WatchProgressDao,
-    private val watchHistoryDao: vid.mat.app.history.WatchHistoryDao
-) {
-    suspend fun createProfile(
-        name: String,
-        avatarColor: String = "#E11D48",
-        isKids: Boolean = false,
-        pin: String? = null
-    ): Long = withContext(Dispatchers.IO) {
-        val cleanName = name.trim()
-        require(cleanName.isNotBlank()) { "Profile name cannot be blank" }
-        val cleanPin = pin?.trim()?.takeIf { it.isNotBlank() }
-        val pinHash = cleanPin?.let(ProfilePinHasher::hash)
-
-        val entity = ProfileEntity(
-            name = cleanName,
-            avatarColorHex = avatarColor,
-            isKidsProfile = isKids,
-            isProtected = pinHash != null,
-            pinHash = pinHash
-        )
-        val id = profileDao.insert(entity)
-        AppLogger.i(TAG, "Created profile '$cleanName' (ID: $id, Kids=$isKids, Protected=${pinHash != null})")
-        id
-    }
-
-    suspend fun deleteProfile(profile: ProfileEntity): Boolean = withContext(Dispatchers.IO) {
-        val all = profileDao.getAllProfiles()
-        if (all.size <= 1) {
-            AppLogger.w(TAG, "Cannot delete the last remaining profile")
-            return@withContext false
-        }
-        if (profile.id == activeProfileProvider.activeProfile.value.id) {
-            val remaining = all.firstOrNull { it.id != profile.id } ?: return@withContext false
-            activeProfileProvider.switchProfile(remaining.id)
-        }
-        favoriteDao.clearProfileFavorites(profile.id)
-        watchProgressDao.clearProfileHistory(profile.id)
-        watchHistoryDao.deleteAll(profile.id)
-        profileDao.delete(profile)
-        true
-    }
-}
-```
-
-#### `profile/ui/ProfileSelectionActivity.kt` — Reuse adapter via `submitList`, add optional PIN field on creation & delete/management support
-```kotlin
-private var profileAdapter: ProfileAdapter? = null
-
-private fun observeProfiles() {
-    profileAdapter = ProfileAdapter(
-        onSelect = { selected ->
-            viewModel.selectProfile(selected) { navigateToMain() }
-        },
-        onLongClick = { selected ->
-            com.google.android.material.dialog.MaterialAlertDialogBuilder(this)
-                .setTitle(selected.name)
-                .setMessage("Delete this profile and its watch history & favorites?")
-                .setPositiveButton("Delete") { _, _ -> viewModel.deleteProfile(selected) }
-                .setNegativeButton("Cancel", null)
-                .show()
-        }
-    )
-    binding.rvProfiles.adapter = profileAdapter
-
-    lifecycleScope.launch {
-        repeatOnLifecycle(Lifecycle.State.STARTED) {
-            viewModel.profiles.collect { list ->
-                profileAdapter?.submitList(list)
-            }
-        }
-    }
-
-    lifecycleScope.launch {
-        repeatOnLifecycle(Lifecycle.State.STARTED) {
-            viewModel.selectedProfileForPin.collect { protectedProfile ->
-                if (protectedProfile != null) {
-                    showPinDialog(protectedProfile)
-                }
-            }
-        }
-    }
-}
-
-private fun showCreateProfileDialog() {
-    val view = layoutInflater.inflate(R.layout.dialog_edit_profile, null)
-    val etName = view.findViewById<EditText>(R.id.etProfileName)
-    val switchKids = view.findViewById<com.google.android.material.switchmaterial.SwitchMaterial>(R.id.switchKidsMode)
-    val pinInputId = resources.getIdentifier("etProfilePin", "id", packageName)
-    val etPin = if (pinInputId != 0) view.findViewById<EditText?>(pinInputId) else null
-
-    MaterialAlertDialogBuilder(this)
-        .setTitle("Create Profile")
-        .setView(view)
-        .setPositiveButton("Create") { _, _ ->
-            val name = etName.text.toString().trim()
-            val pin = etPin?.text?.toString()?.trim()?.takeIf { it.isNotBlank() }
-            if (name.isBlank()) {
-                Toast.makeText(this, "Profile name is required", Toast.LENGTH_SHORT).show()
-                return@setPositiveButton
-            }
-            if (pin != null && (pin.length !in 4..12 || !pin.all(Char::isDigit))) {
-                Toast.makeText(this, "PIN must be 4 to 12 digits", Toast.LENGTH_SHORT).show()
-                return@setPositiveButton
-            }
-            viewModel.createProfile(name, "#E11D48", switchKids.isChecked, pin)
-        }
-        .setNegativeButton("Cancel", null)
-        .show()
-}
-```
-
-#### `profile/ui/ProfileSelectionViewModel.kt` — Add `deleteProfile` action
-```kotlin
-fun deleteProfile(profile: ProfileEntity) = viewModelScope.launch {
-    profileRepository.deleteProfile(profile)
-}
-```
-
----
-
-### 2. Transactional Favorite Synchronization & Channel-Lock Filtering (`ProfileFavoriteSynchronizer.kt`, `UnifiedFavoriteRepository.kt`, `favorites/ui/FavoritesFragment.kt`)
-
-#### `favorites/ProfileFavoriteSynchronizer.kt` — Wrap `syncProfile` in a Room transaction to prevent intermediate UI flicker
-```kotlin
-// Inject `private val database: vid.mat.app.data.database.VideoUrlDatabase`:
-@Singleton
-class ProfileFavoriteSynchronizer @Inject constructor(
-    private val database: vid.mat.app.data.database.VideoUrlDatabase,
-    private val favoriteDao: UnifiedFavoriteDao,
-    private val channelDao: ChannelDao,
-    private val vodMovieDao: VodMovieDao,
+class SeriesRepository @Inject constructor(
     private val seriesDao: SeriesDao,
-    private val videoUrlDao: VideoUrlDao
+    private val playlistSourceRepository: PlaylistSourceRepository,
+    private val providerFactory: IptvProviderFactory,
+    private val favoriteRepository: UnifiedFavoriteRepository,
+    private val xtreamAccountManager: XtreamAccountManager
 ) {
-    suspend fun syncProfile(profileId: Long) = withContext(Dispatchers.IO) {
-        androidx.room.withTransaction(database) {
-            channelDao.clearAllFavoriteFlags()
-            vodMovieDao.clearAllFavoriteFlags()
-            seriesDao.clearAllFavoriteFlags()
-            videoUrlDao.clearAllFavoriteFlags()
+    companion object {
+        private const val TAG = "SeriesRepository"
+        const val PAGE_SIZE = 30
+        const val PREFETCH = 60
+    }
 
-            favoriteDao.getAllForProfile(profileId).forEach { favorite ->
-                when (favorite.type) {
-                    FavoriteType.LIVE_CHANNEL -> {
-                        if (favorite.targetId.startsWith("live_identity:")) {
-                            channelDao.setFavoriteByIdentity(favorite.targetId.removePrefix("live_identity:"), true)
-                        } else {
-                            favorite.targetId.removePrefix("live_").toLongOrNull()?.let { channelDao.setFavorite(it, true) }
+    val continueWatching: Flow<List<SeriesEntity>> = seriesDao.getContinueWatchingSeries()
+    val favorites: Flow<List<SeriesEntity>> = seriesDao.getFavorites()
+
+    suspend fun getSeriesById(seriesDbId: Long): SeriesEntity? = seriesDao.getById(seriesDbId)
+
+    fun getPagedSeries(
+        sourceId: Long? = null,
+        categoryId: String? = null,
+        query: String = "",
+        sortMode: Int = 0,
+        favOnly: Boolean = false
+    ): Flow<PagingData<SeriesEntity>> = Pager(
+        config = PagingConfig(pageSize = PAGE_SIZE, prefetchDistance = PREFETCH, enablePlaceholders = false),
+        pagingSourceFactory = { seriesDao.getPagedSeries(sourceId, categoryId, query, sortMode, favOnly) }
+    ).flow
+
+    fun getCategories(sourceId: Long? = null): Flow<List<SeriesCategoryEntity>> = seriesDao.getDistinctCategories(sourceId)
+    fun countSeries(sourceId: Long? = null): Flow<Int> = seriesDao.countSeries(sourceId)
+
+    suspend fun getSeriesByCategory(sourceId: Long?, categoryId: String, limit: Int = 25): List<SeriesEntity> =
+        seriesDao.getSeriesByCategory(sourceId, categoryId, limit)
+
+    suspend fun toggleFavorite(series: SeriesEntity) {
+        favoriteRepository.toggleFavorite(
+            targetId = FavoriteTargetIds.series(series.id),
+            type = FavoriteType.SERIES,
+            title = series.title,
+            subtitle = series.categoryName,
+            logoUrl = series.coverUrl,
+            streamUrl = "series_${series.id}",
+            groupTitle = series.categoryName
+        )
+    }
+
+    suspend fun getSeasons(seriesDbId: Long): List<SeasonEntity> = seriesDao.getSeasonsForSeries(seriesDbId)
+
+    suspend fun getEpisodes(seriesDbId: Long, seasonNumber: Int): List<EpisodeEntity> =
+        seriesDao.getEpisodesForSeason(seriesDbId, seasonNumber)
+
+    suspend fun getNextEpisode(seriesDbId: Long, currentSeason: Int, currentEpisode: Int): EpisodeEntity? =
+        seriesDao.getNextEpisode(seriesDbId, currentSeason, currentEpisode)
+
+    suspend fun updateEpisodeProgress(seriesDbId: Long, episode: EpisodeEntity, positionMs: Long, durationMs: Long) {
+        val percent = if (durationMs > 0L) ((positionMs.toDouble() / durationMs) * 100).toInt().coerceIn(0, 100) else 0
+        val isWatched = percent >= 90
+        val now = System.currentTimeMillis()
+        seriesDao.updateEpisodeProgress(episode.id, positionMs, durationMs, percent, isWatched, now)
+        seriesDao.updateSeriesLastWatched(seriesDbId, episode.episodeIdStr, episode.seasonNumber, episode.episodeNum, now)
+    }
+
+    suspend fun fetchAndCacheFullSeriesDetails(series: SeriesEntity): Result<SeriesEntity> = withContext(Dispatchers.IO) {
+        try {
+            val source = playlistSourceRepository.getSource(series.sourceId)
+                ?: return@withContext Result.failure(IllegalStateException("Provider source not found for series"))
+            val provider = providerFactory.createProvider(source)
+            val details = provider.fetchSeriesDetails(series.seriesId).getOrThrow()
+            val seasonsList = details.seasons
+            val episodesMap = details.episodes
+
+            val updatedSeries = series.copy(
+                plot = details.plot?.takeIf { it.isNotBlank() } ?: series.plot,
+                cast = details.cast?.takeIf { it.isNotBlank() } ?: series.cast,
+                director = details.director?.takeIf { it.isNotBlank() } ?: series.director,
+                genre = details.genre?.takeIf { it.isNotBlank() } ?: series.genre,
+                rating = details.rating?.takeIf { it.isNotBlank() } ?: series.rating,
+                rating5Based = details.rating?.toFloatOrNull()?.let { it / 2f } ?: series.rating5Based,
+                backdropUrl = details.coverUrl?.takeIf { it.isNotBlank() } ?: series.backdropUrl,
+                totalSeasons = if (seasonsList.isNotEmpty()) seasonsList.size else episodesMap.keys.size,
+                hasFullDetailsLoaded = true
+            )
+            seriesDao.update(updatedSeries)
+
+            val seasonEntities = if (seasonsList.isNotEmpty()) {
+                seasonsList.map { s ->
+                    SeasonEntity(
+                        seriesDbId = series.id,
+                        seriesId = series.seriesId,
+                        seasonNumber = s.seasonNumber,
+                        name = s.name.ifBlank { "Season ${s.seasonNumber}" },
+                        airDate = s.airDate,
+                        episodeCount = s.episodeCount,
+                        coverUrl = s.coverUrl,
+                        overview = s.overview
+                    )
+                }
+            } else {
+                episodesMap.keys.mapNotNull { it.toIntOrNull() }.sorted().map { seasonNum ->
+                    SeasonEntity(
+                        seriesDbId = series.id,
+                        seriesId = series.seriesId,
+                        seasonNumber = seasonNum,
+                        name = "Season $seasonNum",
+                        episodeCount = episodesMap[seasonNum.toString()]?.size ?: 0
+                    )
+                }
+            }
+            if (seasonEntities.isNotEmpty()) {
+                seriesDao.insertSeasons(seasonEntities)
+            }
+
+            val existingEpisodes = seriesDao.getAllEpisodesForSeries(series.id)
+                .associateBy { it.seasonNumber to it.episodeNum }
+            val seenKeys = HashSet<Pair<Int, Int>>()
+            val toInsert = mutableListOf<EpisodeEntity>()
+            val toUpdate = mutableListOf<EpisodeEntity>()
+
+            episodesMap.forEach { (seasonNumStr, epList) ->
+                val seasonNum = seasonNumStr.toIntOrNull() ?: 1
+                epList.forEach { ep ->
+                    val key = seasonNum to ep.episodeNumber
+                    if (!seenKeys.add(key)) return@forEach
+                    val existing = existingEpisodes[key]
+                    if (existing == null) {
+                        toInsert.add(
+                            EpisodeEntity(
+                                seriesDbId = series.id,
+                                seriesId = series.seriesId,
+                                episodeIdStr = ep.id,
+                                seasonNumber = seasonNum,
+                                episodeNum = ep.episodeNumber,
+                                title = ep.title.ifBlank { "Episode ${ep.episodeNumber}" },
+                                containerExtension = ep.containerExtension?.ifBlank { "mp4" } ?: "mp4",
+                                durationSecs = ep.durationSecs ?: 0L,
+                                plot = ep.plot,
+                                movieImage = ep.movieImage,
+                                directSource = ep.directSource,
+                                customSid = ep.customSid
+                            )
+                        )
+                    } else {
+                        toUpdate.add(
+                            existing.copy(
+                                episodeIdStr = ep.id.ifBlank { existing.episodeIdStr },
+                                title = ep.title.ifBlank { existing.title },
+                                containerExtension = ep.containerExtension?.ifBlank { existing.containerExtension } ?: existing.containerExtension,
+                                durationSecs = ep.durationSecs?.takeIf { it > 0L } ?: existing.durationSecs,
+                                plot = ep.plot?.takeIf { it.isNotBlank() } ?: existing.plot,
+                                movieImage = ep.movieImage?.takeIf { it.isNotBlank() } ?: existing.movieImage,
+                                directSource = ep.directSource?.takeIf { it.isNotBlank() } ?: existing.directSource,
+                                customSid = ep.customSid ?: existing.customSid
+                            )
+                        )
+                    }
+                }
+            }
+
+            if (toInsert.isNotEmpty()) seriesDao.insertEpisodes(toInsert)
+            if (toUpdate.isNotEmpty()) seriesDao.updateEpisodes(toUpdate)
+
+            if (seenKeys.isNotEmpty()) {
+                val droppedIds = existingEpisodes.filterKeys { it !in seenKeys }.values.map { it.id }
+                if (droppedIds.isNotEmpty()) {
+                    droppedIds.chunked(250).forEach { seriesDao.deleteEpisodesByIds(series.id, it) }
+                }
+            }
+
+            AppLogger.i(TAG, "Cached ${seasonEntities.size} seasons (${toInsert.size} new, ${toUpdate.size} updated episodes) for ${series.title}")
+            Result.success(updatedSeries)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            AppLogger.w(TAG, "Failed fetching deep series metadata: ${e.message}")
+            Result.success(series)
+        }
+    }
+
+    suspend fun getEpisodeById(episodeId: Long): EpisodeEntity? = seriesDao.getEpisodeById(episodeId)
+
+    suspend fun resolvePlayableEpisodeUrl(series: SeriesEntity, episode: EpisodeEntity): String? {
+        if (!episode.directSource.isNullOrBlank()) return "series_${episode.id}"
+        val creds = xtreamAccountManager.resolveCredentials(series.accountId)
+        if (creds !is XtreamAccountManager.CredentialsResolution.Success) return null
+        return "series_${episode.id}"
+    }
+}
+""",
+
+    "tv/TvVodBrowseFragment.kt": """package vid.mat.app.tv
+
+import android.content.Intent
+import android.os.Bundle
+import android.view.View
+import androidx.core.content.ContextCompat
+import androidx.fragment.app.viewModels
+import androidx.leanback.app.BrowseSupportFragment
+import androidx.leanback.widget.ArrayObjectAdapter
+import androidx.leanback.widget.HeaderItem
+import androidx.leanback.widget.ListRow
+import androidx.leanback.widget.ListRowPresenter
+import androidx.leanback.widget.OnItemViewClickedListener
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.repeatOnLifecycle
+import dagger.hilt.android.AndroidEntryPoint
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.launch
+import vid.mat.app.R
+import vid.mat.app.data.model.VodMovieEntity
+import vid.mat.app.data.repository.VodRepository
+import vid.mat.app.security.ParentalGatekeeper
+import vid.mat.app.ui.vod.VodDetailsActivity
+import vid.mat.app.viewmodel.VodCatalogViewModel
+import javax.inject.Inject
+
+@AndroidEntryPoint
+class TvVodBrowseFragment : BrowseSupportFragment() {
+
+    private val viewModel: VodCatalogViewModel by viewModels()
+    private val rowsAdapter = ArrayObjectAdapter(ListRowPresenter())
+
+    @Inject
+    lateinit var vodRepository: VodRepository
+
+    @Inject
+    lateinit var parentalGatekeeper: ParentalGatekeeper
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        headersState = HEADERS_ENABLED
+        isHeadersTransitionOnBackEnabled = true
+        title = "Movies & VOD"
+        brandColor = ContextCompat.getColor(requireContext(), R.color.tv_brand_color)
+        adapter = rowsAdapter
+
+        onItemViewClickedListener = OnItemViewClickedListener { _, item, _, _ ->
+            if (item is VodMovieEntity) {
+                val intent = Intent(requireContext(), VodDetailsActivity::class.java).apply {
+                    putExtra(VodDetailsActivity.EXTRA_MOVIE_ID, item.id)
+                }
+                startActivity(intent)
+            }
+        }
+    }
+
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        super.onViewCreated(view, savedInstanceState)
+        observeData()
+    }
+
+    private fun observeData() {
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewLifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {
+                viewModel.continueWatching.collectLatest { list ->
+                    val existingFirst = rowsAdapter.size() > 0 && (rowsAdapter.get(0) as? ListRow)?.id == 1L
+                    if (existingFirst) {
+                        rowsAdapter.removeItems(0, 1)
+                    }
+                    val allowed = list.filterNot { parentalGatekeeper.isMovieRestricted(it) }
+                    if (allowed.isNotEmpty()) {
+                        val presenter = TvChannelPresenter(null)
+                        val itemAdapter = ArrayObjectAdapter(presenter).apply { allowed.forEach { add(it) } }
+                        rowsAdapter.add(0, ListRow(HeaderItem(1L, "Continue Watching"), itemAdapter))
+                    }
+                }
+            }
+        }
+
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewLifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {
+                viewModel.categories.collectLatest { categories ->
+                    val hasContinue = rowsAdapter.size() > 0 && (rowsAdapter.get(0) as? ListRow)?.id == 1L
+                    val startIndex = if (hasContinue) 1 else 0
+                    if (rowsAdapter.size() > startIndex) {
+                        rowsAdapter.removeItems(startIndex, rowsAdapter.size() - startIndex)
+                    }
+
+                    val presenter = TvChannelPresenter(null)
+                    categories.take(15).forEachIndexed { index, category ->
+                        if (parentalGatekeeper.isCategoryRestricted(category.categoryName)) return@forEachIndexed
+                        val rowId = (index + 10).toLong()
+                        val movies = vodRepository.getMoviesByCategory(category.sourceId, category.categoryId, 25)
+                            .filterNot { parentalGatekeeper.isMovieRestricted(it) }
+                        if (movies.isNotEmpty()) {
+                            val itemAdapter = ArrayObjectAdapter(presenter).apply { movies.forEach { add(it) } }
+                            rowsAdapter.add(ListRow(HeaderItem(rowId, category.categoryName), itemAdapter))
                         }
                     }
-                    FavoriteType.VOD_MOVIE -> favorite.targetId.removePrefix("movie_").toLongOrNull()?.let { vodMovieDao.setFavorite(it, true) }
-                    FavoriteType.SERIES -> favorite.targetId.removePrefix("series_").toLongOrNull()?.let { seriesDao.setFavorite(it, true) }
-                    FavoriteType.PLAYLIST_URL -> favorite.targetId.removePrefix("url_").toLongOrNull()?.let { videoUrlDao.setFavorite(it, true) }
+                }
+            }
+        }
+    }
+}
+""",
+
+    "tv/TvSeriesBrowseFragment.kt": """package vid.mat.app.tv
+
+import android.content.Intent
+import android.os.Bundle
+import android.view.View
+import androidx.core.content.ContextCompat
+import androidx.fragment.app.viewModels
+import androidx.leanback.app.BrowseSupportFragment
+import androidx.leanback.widget.ArrayObjectAdapter
+import androidx.leanback.widget.HeaderItem
+import androidx.leanback.widget.ListRow
+import androidx.leanback.widget.ListRowPresenter
+import androidx.leanback.widget.OnItemViewClickedListener
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.repeatOnLifecycle
+import dagger.hilt.android.AndroidEntryPoint
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.launch
+import vid.mat.app.R
+import vid.mat.app.data.model.SeriesEntity
+import vid.mat.app.data.repository.SeriesRepository
+import vid.mat.app.security.ParentalGatekeeper
+import vid.mat.app.ui.series.SeriesDetailsActivity
+import vid.mat.app.viewmodel.SeriesCatalogViewModel
+import javax.inject.Inject
+
+@AndroidEntryPoint
+class TvSeriesBrowseFragment : BrowseSupportFragment() {
+
+    private val viewModel: SeriesCatalogViewModel by viewModels()
+    private val rowsAdapter = ArrayObjectAdapter(ListRowPresenter())
+
+    @Inject
+    lateinit var seriesRepository: SeriesRepository
+
+    @Inject
+    lateinit var parentalGatekeeper: ParentalGatekeeper
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        headersState = HEADERS_ENABLED
+        isHeadersTransitionOnBackEnabled = true
+        title = "TV Series & Shows"
+        brandColor = ContextCompat.getColor(requireContext(), R.color.tv_brand_color)
+        adapter = rowsAdapter
+
+        onItemViewClickedListener = OnItemViewClickedListener { _, item, _, _ ->
+            if (item is SeriesEntity) {
+                val intent = Intent(requireContext(), SeriesDetailsActivity::class.java).apply {
+                    putExtra(SeriesDetailsActivity.EXTRA_SERIES_ID, item.id)
+                }
+                startActivity(intent)
+            }
+        }
+    }
+
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        super.onViewCreated(view, savedInstanceState)
+        observeData()
+    }
+
+    private fun observeData() {
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewLifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {
+                viewModel.continueWatching.collectLatest { list ->
+                    val existingFirst = rowsAdapter.size() > 0 && (rowsAdapter.get(0) as? ListRow)?.id == 1L
+                    if (existingFirst) {
+                        rowsAdapter.removeItems(0, 1)
+                    }
+                    val allowed = list.filterNot { parentalGatekeeper.isSeriesRestricted(it) }
+                    if (allowed.isNotEmpty()) {
+                        val presenter = TvChannelPresenter(null)
+                        val itemAdapter = ArrayObjectAdapter(presenter).apply { allowed.forEach { add(it) } }
+                        rowsAdapter.add(0, ListRow(HeaderItem(1L, "Continue Watching"), itemAdapter))
+                    }
+                }
+            }
+        }
+
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewLifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {
+                viewModel.categories.collectLatest { categories ->
+                    val hasContinue = rowsAdapter.size() > 0 && (rowsAdapter.get(0) as? ListRow)?.id == 1L
+                    val startIndex = if (hasContinue) 1 else 0
+                    if (rowsAdapter.size() > startIndex) {
+                        rowsAdapter.removeItems(startIndex, rowsAdapter.size() - startIndex)
+                    }
+
+                    val presenter = TvChannelPresenter(null)
+                    categories.take(15).forEachIndexed { index, category ->
+                        if (parentalGatekeeper.isCategoryRestricted(category.categoryName)) return@forEachIndexed
+                        val rowId = (index + 20).toLong()
+                        val seriesList = seriesRepository.getSeriesByCategory(category.sourceId, category.categoryId, 25)
+                            .filterNot { parentalGatekeeper.isSeriesRestricted(it) }
+                        if (seriesList.isNotEmpty()) {
+                            val itemAdapter = ArrayObjectAdapter(presenter).apply { seriesList.forEach { add(it) } }
+                            rowsAdapter.add(ListRow(HeaderItem(rowId, category.categoryName), itemAdapter))
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+""",
+
+    "tv/TvSearchFragment.kt": """package vid.mat.app.tv
+
+import android.content.Intent
+import android.os.Bundle
+import android.view.View
+import androidx.fragment.app.viewModels
+import androidx.leanback.app.SearchSupportFragment
+import androidx.leanback.widget.ArrayObjectAdapter
+import androidx.leanback.widget.HeaderItem
+import androidx.leanback.widget.ListRow
+import androidx.leanback.widget.ListRowPresenter
+import androidx.leanback.widget.ObjectAdapter
+import androidx.leanback.widget.OnItemViewClickedListener
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.repeatOnLifecycle
+import dagger.hilt.android.AndroidEntryPoint
+import kotlinx.coroutines.launch
+import vid.mat.app.search.model.SearchItem
+import vid.mat.app.ui.series.SeriesDetailsActivity
+import vid.mat.app.ui.vod.VodDetailsActivity
+import vid.mat.app.viewmodel.SearchViewModel
+
+@AndroidEntryPoint
+class TvSearchFragment : SearchSupportFragment(), SearchSupportFragment.SearchResultProvider {
+
+    private val viewModel: SearchViewModel by viewModels()
+    private val rowsAdapter = ArrayObjectAdapter(ListRowPresenter())
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setSearchResultProvider(this)
+        setOnItemViewClickedListener(OnItemViewClickedListener { _, item, _, _ ->
+            if (item is SearchItem) {
+                when (item) {
+                    is SearchItem.LiveChannelItem ->
+                        playMedia(item.id, item.title, item.logoUrl, item.groupTitle, 0L)
+                    is SearchItem.VodMovieItem -> {
+                        val movieDbId = item.movieDbId
+                        if (movieDbId != null && movieDbId > 0L) {
+                            startActivity(
+                                Intent(requireContext(), VodDetailsActivity::class.java).apply {
+                                    putExtra(VodDetailsActivity.EXTRA_MOVIE_ID, movieDbId)
+                                }
+                            )
+                        } else {
+                            playMedia(item.streamUrl, item.title, item.logoUrl, item.groupTitle, 0L)
+                        }
+                    }
+                    is SearchItem.SeriesItem -> {
+                        val seriesDbId = if (item.seriesDbId > 0L) item.seriesDbId else item.seriesId.toLong()
+                        if (seriesDbId > 0L) {
+                            startActivity(
+                                Intent(requireContext(), SeriesDetailsActivity::class.java).apply {
+                                    putExtra(SeriesDetailsActivity.EXTRA_SERIES_ID, seriesDbId)
+                                }
+                            )
+                        }
+                    }
+                    is SearchItem.HistorySearchItem ->
+                        playMedia(item.streamUrl, item.title, item.logoUrl, item.groupTitle, item.resumePositionMs)
                     else -> Unit
                 }
             }
-        }
-    }
-}
-```
-
-#### `favorites/UnifiedFavoriteRepository.kt` — Await profile initialization + filter channel-locked favorites
-```kotlin
-fun getFavorites(
-    type: FavoriteType? = null,
-    group: String? = null,
-    query: String = ""
-): Flow<List<UnifiedFavoriteEntity>> = activeProfileProvider.activeProfile
-    .flatMapLatest { profile ->
-        favoriteDao.getFavoritesFlow(
-            profileId = profile.id,
-            type = if (type == FavoriteType.ALL) null else type,
-            group = group,
-            query = query
-        )
-    }.map { list ->
-        list.filterNot { item ->
-            parentalGatekeeper.isCategoryRestricted(item.groupTitle) ||
-                parentalGatekeeper.isTargetRestricted(item.targetId)
-        }
+        })
     }
 
-suspend fun toggleFavorite(
-    targetId: String,
-    type: FavoriteType,
-    title: String,
-    subtitle: String?,
-    logoUrl: String?,
-    streamUrl: String,
-    groupTitle: String? = null,
-    customGroup: String? = null
-): Boolean = withContext(Dispatchers.IO) {
-    val profileId = activeProfileProvider.awaitInitializedProfile().id
-    val currentlyFav = favoriteDao.isFavorite(targetId, profileId)
-
-    if (currentlyFav) {
-        favoriteDao.deleteByTarget(targetId, profileId)
-        synchronizer.syncProfile(profileId)
-        AppLogger.d(TAG, "Removed favorite '$title' for Profile #$profileId")
-        false
-    } else {
-        val entity = UnifiedFavoriteEntity(
-            targetId = targetId,
-            profileId = profileId,
-            type = type,
-            title = title,
-            subtitle = subtitle,
-            logoUrl = logoUrl,
-            streamUrl = streamUrl,
-            groupTitle = groupTitle,
-            customFavoriteGroup = customGroup
-        )
-        favoriteDao.upsert(entity)
-        synchronizer.syncProfile(profileId)
-        AppLogger.d(TAG, "Added favorite '$title' (${type.name}) for Profile #$profileId")
-        true
-    }
-}
-```
-
-#### `security/ParentalGatekeeper.kt` — Helper used by Favorites & History to enforce channel/item locks
-```kotlin
-fun isTargetRestricted(targetId: String?): Boolean {
-    if (!isProtectionActive || isSessionUnlocked) return false
-    if (targetId.isNullOrBlank()) return false
-    val normalized = when {
-        targetId.startsWith("live_identity:") -> targetId.removePrefix("live_identity:")
-        targetId.startsWith("movie_") -> "vod_${targetId.removePrefix("movie_")}"
-        else -> targetId
-    }
-    return parentalControlManager.isChannelLocked(normalized) ||
-        parentalControlManager.isChannelLocked(targetId)
-}
-```
-
----
-
-### 3. Profile-Scoped History Pruning, Live TV History Recording & Privacy Consistency (`history/WatchHistoryDao.kt`, `WatchHistoryRepository.kt`, `WatchProgressManager.kt`, `player/NewPlayerImpl.kt`)
-
-#### `history/WatchHistoryDao.kt` — Scope `pruneOldest` strictly per profile (fixes cross-profile deletion bug)
-```kotlin
-@Query("""
-    DELETE FROM watch_history
-    WHERE profileId = :profileId
-      AND id IN (
-          SELECT id FROM watch_history
-          WHERE profileId = :profileId
-          ORDER BY watchedAt DESC, id DESC
-          LIMIT -1 OFFSET :maxEntries
-      )
-""")
-abstract suspend fun pruneOldest(profileId: Long, maxEntries: Int = WatchHistory.MAX_ENTRIES)
-
-@Transaction
-open suspend fun recordAndPrune(entry: WatchHistory, maxEntries: Int = WatchHistory.MAX_ENTRIES) {
-    require(maxEntries > 0) { "maxEntries must be greater than 0" }
-    upsert(entry)
-    pruneOldest(entry.profileId, maxEntries)
-}
-```
-
-#### `history/WatchHistoryRepository.kt` — Await initialized profile before recording
-```kotlin
-suspend fun record(
-    url: String, title: String, logoUrl: String?, groupTitle: String?, positionMs: Long, durationMs: Long
-) = withContext(Dispatchers.IO) {
-    if (privacyPrefs.getBoolean("pause_watch_history", false)) return@withContext
-    if (url.isBlank()) return@withContext
-    val profileId = activeProfileProvider.awaitInitializedProfile().id
-    val pct = if (durationMs > 0L) ((positionMs.toDouble() / durationMs) * 100).toInt().coerceIn(0, 100) else 0
-    dao.recordAndPrune(
-        WatchHistory(
-            url = url.trim(),
-            profileId = profileId,
-            title = title,
-            logoUrl = logoUrl,
-            groupTitle = groupTitle,
-            watchedAt = System.currentTimeMillis(),
-            resumePositionMs = positionMs,
-            durationMs = durationMs,
-            completedPercent = pct
-        ),
-        WatchHistory.MAX_ENTRIES
-    )
-}
-```
-
-#### `history/WatchProgressManager.kt` — Allow Live TV entries (`durationMs == 0L`) & enforce profile initialization
-```kotlin
-suspend fun recordProgress(
-    mediaKey: String,
-    contentType: MediaContentType,
-    title: String,
-    subtitle: String?,
-    thumbnailUrl: String?,
-    streamUrl: String,
-    positionMs: Long,
-    durationMs: Long,
-    seriesId: Long? = null,
-    seasonNumber: Int? = null,
-    episodeNumber: Int? = null
-) = withContext(Dispatchers.IO) {
-    if (privacyPrefs.getBoolean("pause_watch_history", false)) return@withContext
-    if (mediaKey.isBlank()) return@withContext
-    if (contentType != MediaContentType.LIVE_TV && durationMs <= 0L) return@withContext
-
-    val profileId = activeProfileProvider.awaitInitializedProfile().id
-    val safeDuration = durationMs.coerceAtLeast(0L)
-    val safePosition = if (safeDuration > 0L) positionMs.coerceIn(0L, safeDuration) else 0L
-    val percent = if (safeDuration > 0L) {
-        ((safePosition.toDouble() / safeDuration) * 100).toInt().coerceIn(0, 100)
-    } else 0
-    val isCompleted = contentType != MediaContentType.LIVE_TV && percent >= COMPLETION_THRESHOLD_PERCENT
-
-    val existing = watchProgressDao.getProgress(mediaKey, profileId)
-
-    val entity = (existing ?: WatchProgressEntity(
-        mediaKey = mediaKey,
-        profileId = profileId,
-        contentType = contentType,
-        mediaTitle = title,
-        streamUrl = streamUrl
-    )).copy(
-        mediaTitle = title,
-        mediaSubtitle = subtitle,
-        thumbnailUrl = thumbnailUrl ?: existing?.thumbnailUrl,
-        streamUrl = streamUrl,
-        positionMs = safePosition,
-        durationMs = safeDuration,
-        completionPercent = percent,
-        isCompleted = isCompleted,
-        lastWatchedTimestampMs = System.currentTimeMillis(),
-        seriesId = seriesId ?: existing?.seriesId,
-        seasonNumber = seasonNumber ?: existing?.seasonNumber,
-        episodeNumber = episodeNumber ?: existing?.episodeNumber
-    )
-
-    watchProgressDao.upsert(entity)
-    AppLogger.d(TAG, "Progress saved for '$title' ($percent%) on Profile #$profileId")
-}
-```
-
-#### `player/NewPlayerImpl.kt` — Include `PlaybackType.LIVE` in `contentTypeForSession` & record Live TV history in `persistWatchProgress`
-```kotlin
-private fun contentTypeForSession(session: PlaybackSession): MediaContentType? = when {
-    session.mediaId.startsWith("series_") -> MediaContentType.SERIES_EPISODE
-    session.mediaId.startsWith("vod_") -> MediaContentType.VOD_MOVIE
-    session.mediaId.startsWith("content://") || session.mediaId.startsWith("file://") || session.mediaId.startsWith("/") -> MediaContentType.LOCAL_VIDEO
-    session.playbackType == PlaybackType.CATCHUP || session.playbackType == PlaybackType.TIMESHIFT -> MediaContentType.LIVE_CATCHUP
-    session.playbackType == PlaybackType.DVR -> MediaContentType.VOD_MOVIE
-    session.playbackType == PlaybackType.LIVE -> MediaContentType.LIVE_TV
-    else -> null
-}
-
-private fun persistWatchProgress(player: Player) {
-    val session = sessionManager.currentSession.value ?: return
-    val contentType = contentTypeForSession(session) ?: return
-    val mediaItem = player.currentMediaItem ?: return
-    val rawDuration = player.duration.takeIf { it > 0L && it != C.TIME_UNSET } ?: 0L
-    if (contentType != MediaContentType.LIVE_TV && rawDuration <= 0L) return
-
-    val position = if (rawDuration > 0L) player.currentPosition.coerceIn(0L, rawDuration) else 0L
-    val title = mediaItem.mediaMetadata.displayTitle?.toString()
-        ?: mediaItem.mediaMetadata.title?.toString()
-        ?: session.mediaId
-
-    val percent = if (rawDuration > 0L) ((position.toDouble() / rawDuration) * 100).toInt().coerceIn(0, 100) else 0
-    val now = System.currentTimeMillis()
-
-    playerScope.launch {
-        watchProgressManager.recordProgress(
-            mediaKey = session.mediaId.ifBlank { mediaItem.mediaId },
-            contentType = contentType,
-            title = title,
-            subtitle = mediaItem.mediaMetadata.subtitle?.toString(),
-            thumbnailUrl = mediaItem.mediaMetadata.artworkUri?.toString(),
-            streamUrl = session.mediaId,
-            positionMs = position,
-            durationMs = rawDuration
-        )
-        if (session.mediaId.startsWith("vod_")) {
-            session.mediaId.removePrefix("vod_").toLongOrNull()?.let { movieId ->
-                vodMovieDao.updateWatchProgress(movieId, position, rawDuration, percent, now)
-            }
-        } else if (session.mediaId.startsWith("series_")) {
-            session.mediaId.removePrefix("series_").toLongOrNull()?.let { epId ->
-                seriesDao.getEpisodeById(epId)?.let { ep ->
-                    seriesDao.updateEpisodeProgress(epId, position, rawDuration, percent, percent >= 90, now)
-                    seriesDao.updateSeriesLastWatched(
-                        ep.seriesDbId,
-                        ep.episodeIdStr,
-                        ep.seasonNumber,
-                        ep.episodeNum,
-                        now
-                    )
-                }
-            }
-        }
-    }
-}
-```
-
-#### `history/ui/UnifiedHistoryViewModel.kt` — Respect active profile parental restrictions in history list
-```kotlin
-// Inject ParentalGatekeeper into UnifiedHistoryViewModel:
-@OptIn(ExperimentalCoroutinesApi::class)
-@HiltViewModel
-class UnifiedHistoryViewModel @Inject constructor(
-    @ApplicationContext private val context: Context,
-    private val watchProgressManager: WatchProgressManager,
-    private val parentalGatekeeper: vid.mat.app.security.ParentalGatekeeper
-) : ViewModel()
-
-// Inside groupAndFilterHistory(...):
-val filtered = list.filter { item ->
-    if (parentalGatekeeper.isCategoryRestricted(item.mediaSubtitle) ||
-        parentalGatekeeper.isTargetRestricted(item.mediaKey)
-    ) {
-        return@filter false
-    }
-    val matchesType = when (filter) {
-        HistoryTypeFilter.ALL -> true
-        HistoryTypeFilter.LIVE_TV -> item.contentType == MediaContentType.LIVE_TV
-        HistoryTypeFilter.MOVIES -> item.contentType == MediaContentType.VOD_MOVIE
-        HistoryTypeFilter.SERIES -> item.contentType == MediaContentType.SERIES_EPISODE
-        HistoryTypeFilter.CATCHUP -> item.contentType == MediaContentType.LIVE_CATCHUP
-    }
-    val matchesQuery = query.isBlank() ||
-        item.mediaTitle.contains(query, ignoreCase = true) ||
-        (item.mediaSubtitle?.contains(query, ignoreCase = true) == true)
-
-    matchesType && matchesQuery
-}
-```
-
----
-
-### Phase 11 Completion Notes
-- **Completed in code above**:
-  - `ActiveProfileProvider` exposes `awaitInitializedProfile()` so early repository writes/queries never hit a temporary guest profile ID before the persisted profile loads.
-  - `ProfileRepository` protects against deleting the final remaining profile and purges profile-scoped favorites, unified watch progress, and legacy history when a profile is deleted.
-  - `ProfileSelectionActivity` reuses its adapter cleanly, reads optional PIN input during profile creation, and supports long-press profile deletion.
-  - `ProfileFavoriteSynchronizer` wraps all 4 legacy table updates in a single Room `@Transaction`, eliminating intermediate favorite UI flicker on profile switches.
-  - `UnifiedFavoriteRepository` and `UnifiedHistoryViewModel` filter restricted targets via `ParentalGatekeeper.isTargetRestricted`.
-  - `history/WatchHistoryDao.pruneOldest` now scopes pruning per `profileId` instead of deleting across all profiles.
-  - `WatchProgressManager` and `NewPlayerImpl` now record `MediaContentType.LIVE_TV` entries into `unified_watch_progress`, populating the `"Live TV"` filter in `UnifiedHistoryFragment`.
-
-Confirm when you are ready to proceed to **Phase 12 — Search and channel organization**.
-Below are **only the new or modified methods, attributes, and targeted edits** for **Phase 12 — Search and Channel Organization**.
-
-*(No full classes are repeated.)*
-
----
-
-### 1. Unified Search Across Live, VOD Movies, Series, EPG & History (`GlobalIptvSearchEngine.kt`, `data/dao/SearchDao.kt`, `ui/search/SearchFragment.kt`)
-
-#### `data/dao/SearchDao.kt` — Resolve overrides & multiple `tvgId` matches cleanly
-```kotlin
-@Query("""
-    SELECT * FROM channels
-    WHERE tvgId = :tvgId OR externalId = :tvgId
-    ORDER BY isFavorite DESC, lastPlayedAtMs DESC
-    LIMIT 1
-""")
-suspend fun getChannelByGuideId(tvgId: String): Channel?
-
-@Query("SELECT * FROM channel_user_overrides")
-suspend fun getAllChannelOverrides(): List<vid.mat.app.data.model.ChannelUserOverrideEntity>
-```
-
-#### `search/GlobalIptvSearchEngine.kt` — Include `vod_movies`, `series`, channel overrides, real EPG channel resolution, and parental gates
-```kotlin
-suspend fun search(rawQuery: String): UnifiedSearchResults = withContext(Dispatchers.IO) {
-    val trimmed = rawQuery.trim()
-    if (trimmed.length < MIN_QUERY_LENGTH) {
-        return@withContext UnifiedSearchResults(query = trimmed)
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        super.onViewCreated(view, savedInstanceState)
+        observeResults()
     }
 
-    val sanitizedLogQuery = SensitiveDataSanitizer.sanitizeText(trimmed)
-    AppLogger.d(TAG, "Executing bounded database search for: '$sanitizedLogQuery'")
-    val nowMs = System.currentTimeMillis()
-
-    coroutineScope {
-        val channelsDeferred = async { searchDao.searchChannels(trimmed, MAX_SECTION_LIMIT) }
-        val overridesDeferred = async { searchDao.getAllChannelOverrides().associateBy { it.channelIdentity } }
-        val vodDeferred = async { searchDao.searchVodMovies(trimmed, MAX_SECTION_LIMIT) }
-        val seriesDeferred = async { searchDao.searchSeries(trimmed, MAX_SECTION_LIMIT) }
-        val legacyDeferred = async { searchDao.searchLegacyVideoUrls(trimmed, 20) }
-        val epgDeferred = async { searchDao.searchFutureEpgPrograms(trimmed, nowMs, 30) }
-        val activeProfileId = activeProfileProvider.awaitInitializedProfile().id
-        val historyDeferred = async { searchDao.searchWatchHistory(trimmed, activeProfileId, 20) }
-
-        val rawChannels = channelsDeferred.await()
-        val overridesMap = overridesDeferred.await()
-        val rawMovies = vodDeferred.await()
-        val rawSeries = seriesDeferred.await()
-        val rawLegacy = legacyDeferred.await()
-        val rawEpg = epgDeferred.await()
-        val rawHistory = historyDeferred.await()
-
-        val channelIds = rawChannels.map { it.channelId }
-        val endpointsMap = if (channelIds.isNotEmpty()) {
-            searchDao.getEndpointsForChannels(channelIds).groupBy { it.channelId }
-        } else emptyMap()
-
-        val liveItems = mutableListOf<SearchItem.LiveChannelItem>()
-        val movieItems = mutableListOf<SearchItem.VodMovieItem>()
-        val seriesItems = mutableListOf<SearchItem.SeriesItem>()
-
-        // 1. Live Channels (applying ChannelUserOverrideEntity hidden/title/group/logo/number)
-        for (ch in rawChannels) {
-            val ov = overridesMap[ch.channelIdentity]
-            if (ov?.isHidden == true) continue
-            val effectiveTitle = ov?.customTitle?.takeIf { it.isNotBlank() } ?: ch.title
-            val effectiveGroup = ov?.customGroupTitle?.takeIf { it.isNotBlank() } ?: ch.groupTitle
-            val effectiveLogo = ov?.customLogoUrl?.takeIf { it.isNotBlank() } ?: ch.logoUrl
-            val effectiveNumber = ov?.customChannelNumber ?: ch.channelNumber
-
-            if (parentalControl.isChannelRestricted(ch.copy(title = effectiveTitle, groupTitle = effectiveGroup))) continue
-            val score = SearchQueryNormalizer.calculateScore(effectiveTitle, trimmed)
-            if (score <= 0) continue
-
-            val primaryEndpoint = endpointsMap[ch.channelId]?.firstOrNull()
-            val streamUrl = primaryEndpoint?.url ?: ch.channelIdentity
-            liveItems.add(
-                SearchItem.LiveChannelItem(
-                    id = ch.channelIdentity,
-                    title = effectiveTitle,
-                    subtitle = effectiveGroup,
-                    logoUrl = effectiveLogo,
-                    groupTitle = effectiveGroup,
-                    streamUrl = streamUrl,
-                    channelNumber = effectiveNumber,
-                    tvgId = ch.tvgId,
-                    isFavorite = ch.isFavorite,
-                    score = score
-                )
-            )
-        }
-
-        // 2. VOD Movies from `vod_movies`
-        for (movie in rawMovies) {
-            if (parentalControl.isMovieRestricted(movie)) continue
-            val titleScore = SearchQueryNormalizer.calculateScore(movie.title, trimmed)
-            val metaScore = maxOf(
-                SearchQueryNormalizer.calculateScore(movie.genre, trimmed),
-                SearchQueryNormalizer.calculateScore(movie.cast, trimmed)
-            ) / 2
-            val score = maxOf(titleScore, metaScore)
-            if (score <= 0) continue
-
-            movieItems.add(
-                SearchItem.VodMovieItem(
-                    id = "vod_${movie.id}",
-                    title = movie.title,
-                    subtitle = movie.year?.takeIf { it.isNotBlank() } ?: movie.categoryName,
-                    logoUrl = movie.posterUrl ?: movie.backdropUrl,
-                    groupTitle = movie.categoryName,
-                    streamUrl = "vod_${movie.id}",
-                    containerExtension = movie.containerExtension,
-                    rating = movie.rating,
-                    movieDbId = movie.id,
-                    score = score
-                )
-            )
-        }
-
-        // 3. Series from `series`
-        for (s in rawSeries) {
-            if (parentalControl.isSeriesRestricted(s)) continue
-            val titleScore = SearchQueryNormalizer.calculateScore(s.title, trimmed)
-            val metaScore = maxOf(
-                SearchQueryNormalizer.calculateScore(s.genre, trimmed),
-                SearchQueryNormalizer.calculateScore(s.cast, trimmed)
-            ) / 2
-            val score = maxOf(titleScore, metaScore)
-            if (score <= 0) continue
-
-            seriesItems.add(
-                SearchItem.SeriesItem(
-                    id = "series_${s.id}",
-                    title = s.title,
-                    subtitle = s.genre?.takeIf { it.isNotBlank() } ?: s.categoryName,
-                    logoUrl = s.coverUrl ?: s.backdropUrl,
-                    groupTitle = s.categoryName,
-                    seriesId = s.seriesId,
-                    seriesDbId = s.id,
-                    genre = s.genre,
-                    releaseDate = s.releaseDate,
-                    score = score
-                )
-            )
-        }
-
-        // 4. Legacy `video_urls`
-        for (v in rawLegacy) {
-            if (isRestricted(v.groupTitle) || parentalControl.isTargetRestricted(v.url)) continue
-            if (liveItems.none { it.streamUrl == v.url }) {
-                val score = SearchQueryNormalizer.calculateScore(v.title, trimmed)
-                if (score > 0) {
-                    liveItems.add(
-                        SearchItem.LiveChannelItem(
-                            id = v.url,
-                            title = v.title,
-                            subtitle = v.groupTitle,
-                            logoUrl = v.logoUrl,
-                            groupTitle = v.groupTitle,
-                            streamUrl = v.url,
-                            channelNumber = null,
-                            tvgId = v.tvgId,
-                            isFavorite = v.isFavorite,
-                            score = score
-                        )
-                    )
-                }
-            }
-        }
-
-        // 5. Future EPG Programs — resolve real Channel metadata so Watch Live / Catch-Up / DVR work
-        val epgItems = mutableListOf<SearchItem.EpgProgramItem>()
-        for (prog in rawEpg) {
-            val score = SearchQueryNormalizer.calculateScore(prog.title, trimmed)
-            if (score <= 0) continue
-            val matchedChannel = searchDao.getChannelByGuideId(prog.channelId)
-            if (matchedChannel != null && parentalControl.isChannelRestricted(matchedChannel)) continue
-            if (matchedChannel == null && isRestricted(prog.category)) continue
-
-            val isAiringNow = prog.startMs <= nowMs && prog.stopMs > nowMs
-            epgItems.add(
-                SearchItem.EpgProgramItem(
-                    id = "epg_${prog.id}",
-                    title = prog.title,
-                    subtitle = prog.category ?: prog.description?.take(60),
-                    logoUrl = matchedChannel?.logoUrl,
-                    groupTitle = matchedChannel?.groupTitle ?: prog.category,
-                    channelTvgId = prog.channelId,
-                    channelName = matchedChannel?.title ?: prog.channelId,
-                    channelId = matchedChannel?.channelId,
-                    channelIdentity = matchedChannel?.channelIdentity,
-                    startEpochMs = prog.startMs,
-                    stopEpochMs = prog.stopMs,
-                    isAiringNow = isAiringNow,
-                    score = score + if (isAiringNow) 20 else 0
-                )
-            )
-        }
-
-        // 6. Watch History
-        val historyItems = mutableListOf<SearchItem.HistorySearchItem>()
-        for (h in rawHistory) {
-            if (isRestricted(h.groupTitle) || parentalControl.isTargetRestricted(h.url)) continue
-            val score = SearchQueryNormalizer.calculateScore(h.title, trimmed)
-            if (score > 0) {
-                historyItems.add(
-                    SearchItem.HistorySearchItem(
-                        id = "hist_${h.id}",
-                        title = h.title,
-                        subtitle = h.groupTitle ?: "${h.completedPercent}% watched",
-                        logoUrl = h.logoUrl,
-                        groupTitle = h.groupTitle,
-                        streamUrl = h.url,
-                        resumePositionMs = h.resumePositionMs,
-                        durationMs = h.durationMs,
-                        completedPercent = h.completedPercent,
-                        score = score
-                    )
-                )
-            }
-        }
-
-        val rankedLive = liveItems.sortedByDescending { it.score }.take(MAX_SECTION_LIMIT)
-        val rankedMovies = movieItems.sortedByDescending { it.score }.take(MAX_SECTION_LIMIT)
-        val rankedSeries = seriesItems.sortedByDescending { it.score }.take(MAX_SECTION_LIMIT)
-        val rankedEpg = epgItems.sortedByDescending { it.score }.take(MAX_SECTION_LIMIT)
-        val rankedHistory = historyItems.sortedByDescending { it.score }.take(MAX_SECTION_LIMIT)
-
-        UnifiedSearchResults(
-            query = trimmed,
-            liveChannels = rankedLive,
-            movies = rankedMovies,
-            series = rankedSeries,
-            epgPrograms = rankedEpg,
-            historyItems = rankedHistory,
-            totalCount = rankedLive.size + rankedMovies.size + rankedSeries.size + rankedEpg.size + rankedHistory.size
-        )
-    }
-}
-```
-
-#### `ui/search/SearchFragment.kt` — Handle EPG search results cleanly when channel is missing
-```kotlin
-// Inside handleItemClick(item: SearchItem) -> is SearchItem.EpgProgramItem:
-is SearchItem.EpgProgramItem -> {
-    val chId = item.channelId
-    val chIdentity = item.channelIdentity
-    if (chId == null || chIdentity.isNullOrBlank()) {
-        android.widget.Toast.makeText(
-            requireContext(),
-            "Channel for '${item.title}' is not in your playlist.",
-            android.widget.Toast.LENGTH_SHORT
-        ).show()
-        return
-    }
-    val resolvedChannel = Channel(
-        channelId = chId,
-        sourceId = 0L,
-        channelIdentity = chIdentity,
-        title = item.channelName,
-        logoUrl = item.logoUrl,
-        tvgId = item.channelTvgId,
-        groupTitle = item.groupTitle
-    )
-    val program = EpgProgram(
-        channelId = item.channelTvgId,
-        title = item.title,
-        description = item.subtitle,
-        category = item.groupTitle,
-        startMs = item.startEpochMs,
-        stopMs = item.stopEpochMs
-    )
-    EpgProgramDetailsBottomSheet.newInstance(resolvedChannel, program)
-        .show(parentFragmentManager, EpgProgramDetailsBottomSheet.TAG)
-}
-```
-
----
-
-### 2. Channel Organization Persistence & Drag-and-Drop / Custom Group Fixes (`ChannelOrganizationRepository.kt`, `ChannelOrganizationViewModel.kt`, `ChannelOrganizationFragment.kt`)
-
-#### `data/repository/ChannelOrganizationRepository.kt` — Preserve custom `userOrderIndex` stability & prune orphaned overrides cleanly
-```kotlin
-suspend fun getOrganizedChannels(
-    groupFilter: String? = null,
-    includeHidden: Boolean = false
-): List<OrganizedChannel> = withContext(Dispatchers.IO) {
-    val rawChannels = channelDao.getAllOrdered(100_000)
-    val overridesMap = overrideDao.getAll().associateBy { it.channelIdentity }
-
-    rawChannels.map { ch ->
-        val override = overridesMap[ch.channelIdentity]
-        OrganizedChannel(channel = ch, override = override)
-    }.filter { item ->
-        (includeHidden || !item.isHidden) &&
-            (groupFilter == null || item.displayGroup.equals(groupFilter, ignoreCase = true))
-    }.sortedWith(
-        compareBy<OrganizedChannel> { it.orderIndex }
-            .thenBy { it.displayNumber ?: Int.MAX_VALUE }
-            .thenBy { it.displayTitle }
-    )
-}
-
-suspend fun createCustomGroup(name: String) = withContext(Dispatchers.IO) {
-    val trimmed = name.trim()
-    if (trimmed.isNotBlank()) {
-        groupDao.insert(CustomGroupEntity(name = trimmed))
-    }
-}
-```
-
-#### `viewmodel/ChannelOrganizationViewModel.kt` — Support `deleteCustomGroup` & immediate reactive refresh on drag-and-drop without visual jump
-```kotlin
-fun deleteCustomGroup(name: String) = viewModelScope.launch {
-    organizationRepo.deleteCustomGroup(name)
-    if (_selectedGroup.value == name) {
-        _selectedGroup.value = null
-    }
-    loadChannels()
-}
-
-fun saveReorderedChannels() = viewModelScope.launch {
-    val current = _organizedChannels.value
-    val identities = current.map { it.channel.channelIdentity }
-    organizationRepo.reorderChannels(identities)
-    // Keep the UI order synchronized with persisted userOrderIndex values
-    _organizedChannels.value = current.mapIndexed { idx, item ->
-        val updatedOverride = (item.override ?: vid.mat.app.data.model.ChannelUserOverrideEntity(
-            channelIdentity = item.channel.channelIdentity
-        )).copy(userOrderIndex = idx)
-        item.copy(override = updatedOverride)
-    }
-}
-```
-
-#### `ui/organization/ChannelOrganizationFragment.kt` — Use `notifyItemMoved` cleanly without full `notifyDataSetChanged` churn on drop, and fix hidden switch
-```kotlin
-private fun setupListeners() {
-    binding.btnIncludeHidden.setOnCheckedChangeListener { _, _ ->
-        viewModel.toggleIncludeHidden()
-    }
-
-    binding.btnResetAll.setOnClickListener {
-        MaterialAlertDialogBuilder(requireContext())
-            .setTitle("Reset All Channel Overrides?")
-            .setMessage("This will remove all custom names, drag-and-drop orders, and custom channel numbers, restoring provider defaults.")
-            .setPositiveButton("Reset All") { _, _ -> viewModel.resetAllOverrides() }
-            .setNegativeButton("Cancel", null)
-            .show()
-    }
-}
-```
-
----
-
-### Phase 12 Completion Notes
-- **Completed in code above**:
-  - `GlobalIptvSearchEngine` now returns real results from `vod_movies` (`VodMovieItem` with `movieDbId`) and `series` (`SeriesItem` with `seriesDbId`), applies `ChannelUserOverrideEntity` (hidden status, custom title, custom group, logo, channel number) to Live TV search results, resolves real `Channel` IDs/identities for `EpgProgramItem`, and enforces channel-level parental locks across all result categories.
-  - `SearchFragment` guards against EPG results whose channel isn't in the user's catalog instead of opening a broken synthetic channel.
-  - `ChannelOrganizationViewModel` adds `deleteCustomGroup` and updates in-memory override order indices smoothly after drag-and-drop without resetting scroll position.
-
-Confirm when you are ready to proceed to **Phase 13 — Android TV interface and remote navigation**.
-Below are **only the new or modified methods, attributes, and targeted edits** for **Phase 13 — Android TV Interface and Remote Navigation**.
-
-*(No full classes are repeated.)*
-
----
-
-### 1. Compilation & Complete Card Binding (`tv/TvChannelPresenter.kt`)
-
-#### `tv/TvChannelPresenter.kt` — Add missing entity/search imports & handle `HomeCardItem` / `Channel` EPG subtitles
-```kotlin
-// Add missing imports at top of file:
-import vid.mat.app.data.model.SeriesEntity
-import vid.mat.app.data.model.VodMovieEntity
-import vid.mat.app.search.model.SearchItem
-
-// Update onBindViewHolder for Channel to also show Now/Next EPG when available:
-is Channel -> {
-    card.titleText = item.title
-    val epgText = item.tvgId?.let { tvgId ->
-        val cached = epgViewModel?.getCachedNowNext(tvgId)
-        if (cached != null && !cached.isEmpty) cached.toDisplayString()
-        else {
-            epgViewModel?.requestNowAndNext(tvgId)
-            null
-        }
-    }
-    card.contentText = epgText ?: item.groupTitle ?: ""
-    loadLogo(card, item.title, item.logoUrl)
-}
-```
-
----
-
-### 2. Android TV VOD & Series Browsing (`data/repository/VodRepository.kt`, `data/repository/SeriesRepository.kt`, `tv/TvVodBrowseFragment.kt`, `tv/TvSeriesBrowseFragment.kt`, `tv/TvSearchFragment.kt`)
-
-#### `data/repository/VodRepository.kt` & `data/repository/SeriesRepository.kt` — Add direct category queries for TV Browse rows
-```kotlin
-// data/repository/VodRepository.kt:
-suspend fun getMoviesByCategory(sourceId: Long?, categoryId: String, limit: Int = 25): List<VodMovieEntity> =
-    vodDao.getMoviesByCategory(sourceId, categoryId, limit)
-
-// data/repository/SeriesRepository.kt:
-suspend fun getSeriesByCategory(sourceId: Long?, categoryId: String, limit: Int = 25): List<SeriesEntity> =
-    seriesDao.getSeriesByCategory(sourceId, categoryId, limit)
-```
-
-#### `tv/TvVodBrowseFragment.kt` — Actually populate VOD category rows & respect parental restrictions
-```kotlin
-@Inject
-lateinit var parentalGatekeeper: vid.mat.app.security.ParentalGatekeeper
-
-private fun observeData() {
-    viewLifecycleOwner.lifecycleScope.launch {
-        viewLifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {
-            viewModel.continueWatching.collectLatest { list ->
-                rowsAdapter.clear()
-                val allowed = list.filterNot { parentalGatekeeper.isMovieRestricted(it) }
-                if (allowed.isNotEmpty()) {
-                    val presenter = TvChannelPresenter(null)
-                    val itemAdapter = ArrayObjectAdapter(presenter).apply { allowed.forEach { add(it) } }
-                    rowsAdapter.add(ListRow(HeaderItem(1L, "Continue Watching"), itemAdapter))
-                }
-            }
-        }
-    }
-
-    viewLifecycleOwner.lifecycleScope.launch {
-        viewLifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {
-            viewModel.categories.collectLatest { categories ->
-                // Preserve row 1 (Continue Watching) if present, replace category rows cleanly
-                while (rowsAdapter.size() > 1) rowsAdapter.removeItems(1, 1)
-                if (rowsAdapter.size() == 1 && (rowsAdapter.get(0) as? ListRow)?.id != 1L) {
+    private fun observeResults() {
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewLifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {
+                viewModel.uiState.collect { state ->
                     rowsAdapter.clear()
-                }
+                    if (state is SearchViewModel.SearchUiState.Success) {
+                        val presenter = TvChannelPresenter(null)
 
-                val presenter = TvChannelPresenter(null)
-                categories.take(15).forEachIndexed { index, category ->
-                    if (parentalGatekeeper.isCategoryRestricted(category.categoryName)) return@forEachIndexed
-                    val rowId = (index + 10).toLong()
-                    val movies = vodRepository.getMoviesByCategory(category.sourceId, category.categoryId, 25)
-                        .filterNot { parentalGatekeeper.isMovieRestricted(it) }
-                    if (movies.isNotEmpty()) {
-                        val itemAdapter = ArrayObjectAdapter(presenter).apply { movies.forEach { add(it) } }
-                        rowsAdapter.add(ListRow(HeaderItem(rowId, category.categoryName), itemAdapter))
-                    }
-                }
-            }
-        }
-    }
-}
-```
-
-#### `tv/TvSeriesBrowseFragment.kt` — Actually populate Series category rows & respect parental restrictions
-```kotlin
-@Inject
-lateinit var parentalGatekeeper: vid.mat.app.security.ParentalGatekeeper
-
-private fun observeData() {
-    viewLifecycleOwner.lifecycleScope.launch {
-        viewLifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {
-            viewModel.continueWatching.collectLatest { list ->
-                rowsAdapter.clear()
-                val allowed = list.filterNot { parentalGatekeeper.isSeriesRestricted(it) }
-                if (allowed.isNotEmpty()) {
-                    val presenter = TvChannelPresenter(null)
-                    val itemAdapter = ArrayObjectAdapter(presenter).apply { allowed.forEach { add(it) } }
-                    rowsAdapter.add(ListRow(HeaderItem(1L, "Continue Watching"), itemAdapter))
-                }
-            }
-        }
-    }
-
-    viewLifecycleOwner.lifecycleScope.launch {
-        viewLifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {
-            viewModel.categories.collectLatest { categories ->
-                while (rowsAdapter.size() > 1) rowsAdapter.removeItems(1, 1)
-                if (rowsAdapter.size() == 1 && (rowsAdapter.get(0) as? ListRow)?.id != 1L) {
-                    rowsAdapter.clear()
-                }
-
-                val presenter = TvChannelPresenter(null)
-                categories.take(15).forEachIndexed { index, category ->
-                    if (parentalGatekeeper.isCategoryRestricted(category.categoryName)) return@forEachIndexed
-                    val rowId = (index + 20).toLong()
-                    val seriesList = seriesRepository.getSeriesByCategory(category.sourceId, category.categoryId, 25)
-                        .filterNot { parentalGatekeeper.isSeriesRestricted(it) }
-                    if (seriesList.isNotEmpty()) {
-                        val itemAdapter = ArrayObjectAdapter(presenter).apply { seriesList.forEach { add(it) } }
-                        rowsAdapter.add(ListRow(HeaderItem(rowId, category.categoryName), itemAdapter))
-                    }
-                }
-            }
-        }
-    }
-}
-```
-
-#### `tv/TvSearchFragment.kt` — Handle `LiveChannelItem` identity, `VodMovieItem` details, and `SeriesItem` navigation
-```kotlin
-override fun onCreate(savedInstanceState: Bundle?) {
-    super.onCreate(savedInstanceState)
-    setSearchResultProvider(this)
-    setOnItemViewClickedListener(OnItemViewClickedListener { _, item, _, _ ->
-        if (item is SearchItem) {
-            when (item) {
-                is SearchItem.LiveChannelItem ->
-                    playMedia(item.id, item.title, item.logoUrl, item.groupTitle, 0L)
-                is SearchItem.VodMovieItem -> {
-                    val movieDbId = item.movieDbId
-                    if (movieDbId != null && movieDbId > 0L) {
-                        startActivity(
-                            Intent(requireContext(), vid.mat.app.ui.vod.VodDetailsActivity::class.java).apply {
-                                putExtra(vid.mat.app.ui.vod.VodDetailsActivity.EXTRA_MOVIE_ID, movieDbId)
+                        if (state.results.liveChannels.isNotEmpty()) {
+                            val channelAdapter = ArrayObjectAdapter(presenter).apply {
+                                state.results.liveChannels.forEach { add(it) }
                             }
-                        )
-                    } else {
-                        playMedia(item.streamUrl, item.title, item.logoUrl, item.groupTitle, 0L)
-                    }
-                }
-                is SearchItem.SeriesItem -> {
-                    val seriesDbId = if (item.seriesDbId > 0L) item.seriesDbId else item.seriesId.toLong()
-                    if (seriesDbId > 0L) {
-                        startActivity(
-                            Intent(requireContext(), vid.mat.app.ui.series.SeriesDetailsActivity::class.java).apply {
-                                putExtra(vid.mat.app.ui.series.SeriesDetailsActivity.EXTRA_SERIES_ID, seriesDbId)
+                            rowsAdapter.add(ListRow(HeaderItem(0, "Live Channels"), channelAdapter))
+                        }
+
+                        if (state.results.movies.isNotEmpty()) {
+                            val movieAdapter = ArrayObjectAdapter(presenter).apply {
+                                state.results.movies.forEach { add(it) }
                             }
-                        )
-                    }
-                }
-                is SearchItem.HistorySearchItem ->
-                    playMedia(item.streamUrl, item.title, item.logoUrl, item.groupTitle, item.resumePositionMs)
-                else -> Unit
-            }
-        }
-    })
-}
-```
+                            rowsAdapter.add(ListRow(HeaderItem(1, "Movies (VOD)"), movieAdapter))
+                        }
 
----
-
-### 3. Android TV Channel Surfing, FastZapper Security, Focus & Playback (`ChannelSurfingCoordinator.kt`, `TvBrowseFragment.kt`, `TvPlaybackActivity.kt`)
-
-#### `player/surfing/ChannelSurfingCoordinator.kt` — Use `StreamResolver` credentials for pre-warming & sync `ChannelNavigationController` active index
-```kotlin
-// Update preWarmAdjacentChannels() to pass credentials only via StreamResolver (or avoid unauthenticated X-AUTH-INJECT pre-warm):
-private fun preWarmAdjacentChannels() {
-    preWarmJob?.cancel()
-    preWarmJob = scope.launch(Dispatchers.IO) {
-        delay(250)
-        if (activeChannelsList.size < 2 || currentChannelIndex < 0) return@launch
-
-        val nextIdx = (currentChannelIndex + 1) % activeChannelsList.size
-        val nextChannel = activeChannelsList.getOrNull(nextIdx) ?: return@launch
-
-        val endpoints = channelRepository.getEndpointsForChannel(nextChannel.channelId)
-        val primaryEndpoint = endpoints.firstOrNull() ?: return@launch
-        // Do not pre-warm Xtream placeholder URLs without resolved credentials
-        if (primaryEndpoint.url.contains("/X-AUTH-INJECT/") || primaryEndpoint.url.startsWith("xtream://")) {
-            return@launch
-        }
-
-        val headers = OkHttpStreamingClient.StreamHeaders(
-            userAgent = primaryEndpoint.userAgent,
-            referer = primaryEndpoint.referer?.value,
-            cookie = primaryEndpoint.cookie?.value,
-            authorization = primaryEndpoint.authorization?.value
-        )
-
-        AppLogger.d(TAG, "FastZapper pre-warming next adjacent channel: ${nextChannel.title}")
-        zapper.preWarm(primaryEndpoint.url, headers)
-    }
-}
-
-private fun switchChannel(channel: Channel) {
-    AppLogger.i(TAG, "Zapping to channel: ${channel.title} (#${channel.channelNumber ?: (currentChannelIndex + 1)})")
-    _currentChannel.value = channel
-    navController.updateChannelList(activeChannelsList, channel.channelId)
-    player.playStream(channel.channelIdentity, PlayMode.FULLSCREEN_VIDEO)
-    preWarmAdjacentChannels()
-}
-```
-
-#### `tv/TvBrowseFragment.kt` — Filter restricted channels & apply `ChannelOrganizationRepository` overrides + focus restoration
-```kotlin
-@Inject
-lateinit var parentalGatekeeper: vid.mat.app.security.ParentalGatekeeper
-
-@Inject
-lateinit var channelOrganizationRepository: vid.mat.app.data.repository.ChannelOrganizationRepository
-
-private val focusCoordinator = vid.mat.app.tv.navigation.TvFocusCoordinator()
-
-override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
-    super.onViewCreated(view, savedInstanceState)
-
-    onItemViewClickedListener = OnItemViewClickedListener { itemViewHolder, item, _, _ ->
-        itemViewHolder?.view?.let { focusCoordinator.recordFocus(it) }
-        when (item) {
-            is Channel -> launchPlayer(item.channelIdentity, item.title, item.logoUrl, 0L)
-            is WatchHistory -> launchPlayer(item.url, item.title, item.logoUrl, item.resumePositionMs)
-        }
-    }
-
-    observeRows()
-}
-
-override fun onResume() {
-    super.onResume()
-    focusCoordinator.restoreFocus(view)
-}
-
-private fun observeRows() {
-    val isLowEnd = DeviceCapabilityProfile.isLowEndHardware(requireContext())
-    val maxChannelPerGroup = if (isLowEnd) 15 else 25
-    val maxGroups = if (isLowEnd) 8 else 15
-
-    viewLifecycleOwner.lifecycleScope.launch {
-        viewLifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {
-            historyViewModel.continueWatching.collectLatest { items ->
-                val allowed = items.filterNot {
-                    parentalGatekeeper.isCategoryRestricted(it.groupTitle) ||
-                        parentalGatekeeper.isTargetRestricted(it.url)
-                }
-                if (allowed.isNotEmpty()) upsertRow(ROW_CONTINUE, "Continue Watching", allowed.take(10))
-                else removeRow(ROW_CONTINUE)
-            }
-        }
-    }
-
-    viewLifecycleOwner.lifecycleScope.launch {
-        viewLifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {
-            channelRepository.favorites.collectLatest { items ->
-                val allowed = items.filterNot { parentalGatekeeper.isChannelRestricted(it) }
-                if (allowed.isNotEmpty()) upsertRow(ROW_FAVORITES, "Favourites", allowed.take(maxChannelPerGroup))
-                else removeRow(ROW_FAVORITES)
-            }
-        }
-    }
-
-    viewLifecycleOwner.lifecycleScope.launch {
-        viewLifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {
-            channelRepository.recents.collectLatest { items ->
-                val allowed = items.filterNot { parentalGatekeeper.isChannelRestricted(it) }
-                if (allowed.isNotEmpty()) upsertRow(ROW_RECENTS, "Recently Watched", allowed.take(maxChannelPerGroup))
-                else removeRow(ROW_RECENTS)
-            }
-        }
-    }
-
-    viewLifecycleOwner.lifecycleScope.launch {
-        viewLifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {
-            channelRepository.distinctGroups.collectLatest { groups ->
-                val visibleGroups = groups.filterNot { parentalGatekeeper.isCategoryRestricted(it) }.take(maxGroups)
-                visibleGroups.forEachIndexed { i, groupName ->
-                    val rowId = CATEGORY_ROW_BASE + i
-                    val organized = channelOrganizationRepository.getOrganizedChannels(
-                        groupFilter = groupName,
-                        includeHidden = false
-                    ).map { org ->
-                        org.channel.copy(
-                            title = org.displayTitle,
-                            groupTitle = org.displayGroup,
-                            logoUrl = org.displayLogo,
-                            channelNumber = org.displayNumber
-                        )
-                    }.filterNot { parentalGatekeeper.isChannelRestricted(it) }
-                        .take(maxChannelPerGroup)
-
-                    if (organized.isNotEmpty()) {
-                        upsertRow(rowId, groupName, organized)
-                    } else {
-                        removeRow(rowId)
+                        if (state.results.series.isNotEmpty()) {
+                            val seriesAdapter = ArrayObjectAdapter(presenter).apply {
+                                state.results.series.forEach { add(it) }
+                            }
+                            rowsAdapter.add(ListRow(HeaderItem(2, "Series"), seriesAdapter))
+                        }
                     }
                 }
             }
         }
     }
-}
-```
 
-#### `tv/TvPlaybackActivity.kt` — Wire `ChannelSurfingCoordinator` & `TvKeyNavigationHandler` for D-pad/number-pad surfing + safe service stop
-```kotlin
-@Inject
-lateinit var channelRepository: vid.mat.app.data.repository.ChannelRepository
+    override fun getResultsAdapter(): ObjectAdapter = rowsAdapter
 
-@Inject
-lateinit var organizationRepository: vid.mat.app.data.repository.ChannelOrganizationRepository
-
-private var surfingCoordinator: vid.mat.app.player.surfing.ChannelSurfingCoordinator? = null
-
-// Inside onCreate(...) after setting up videoFragment:
-val rootContainer = findViewById<android.view.ViewGroup>(android.R.id.content)
-surfingCoordinator = vid.mat.app.player.surfing.ChannelSurfingCoordinator(
-    activity = this,
-    player = viewModel.newPlayer,
-    channelRepository = channelRepository,
-    organizationRepository = organizationRepository,
-    epgViewModel = null,
-    osdContainer = rootContainer
-).also {
-    it.initialize(data.mediaPath)
-}
-
-override fun dispatchKeyEvent(event: android.view.KeyEvent): Boolean {
-    if (TvKeyNavigationHandler.dispatchKeyEvent(event, surfingCoordinator)) {
+    override fun onQueryTextChange(newQuery: String?): Boolean {
+        viewModel.onQueryChanged(newQuery.orEmpty())
         return true
     }
-    return super.dispatchKeyEvent(event)
-}
 
-override fun onDestroy() {
-    super.onDestroy()
-    positionSaveJob?.cancel()
-    surfingCoordinator?.destroy()
-    surfingCoordinator = null
-    lastAttachedPlayer = null
-    AutoFrameRateManager.cleanupActivity(this)
+    override fun onQueryTextSubmit(query: String?): Boolean {
+        viewModel.onQueryChanged(query.orEmpty())
+        return true
+    }
 
-    if (isFinishing) {
-        stopService(Intent(this, PlaybackService::class.java))
+    private fun playMedia(url: String, title: String, logo: String?, group: String?, resumeMs: Long) {
+        startActivity(Intent(requireContext(), TvPlaybackActivity::class.java).apply {
+            putExtra(TvPlaybackActivity.EXTRA_URL, url)
+            putExtra(TvPlaybackActivity.EXTRA_TITLE, title)
+            putExtra(TvPlaybackActivity.EXTRA_LOGO, logo)
+            putExtra(TvPlaybackActivity.EXTRA_RESUME_MS, resumeMs)
+            putExtra("group_title", group)
+        })
     }
 }
+""",
+
+    "tv/TvBrowseFragment.kt": """package vid.mat.app.tv
+
+import android.content.Intent
+import android.os.Bundle
+import android.view.View
+import androidx.core.content.ContextCompat
+import androidx.fragment.app.viewModels
+import androidx.leanback.app.BrowseSupportFragment
+import androidx.leanback.widget.ArrayObjectAdapter
+import androidx.leanback.widget.HeaderItem
+import androidx.leanback.widget.ListRow
+import androidx.leanback.widget.ListRowPresenter
+import androidx.leanback.widget.OnItemViewClickedListener
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.repeatOnLifecycle
+import dagger.hilt.android.AndroidEntryPoint
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.launch
+import vid.mat.app.R
+import vid.mat.app.data.model.Channel
+import vid.mat.app.data.repository.ChannelOrganizationRepository
+import vid.mat.app.data.repository.ChannelRepository
+import vid.mat.app.epg.EpgViewModel
+import vid.mat.app.history.WatchHistory
+import vid.mat.app.history.WatchHistoryViewModel
+import vid.mat.app.security.ParentalGatekeeper
+import vid.mat.app.tv.navigation.TvFocusCoordinator
+import vid.mat.app.util.performance.DeviceCapabilityProfile
+import javax.inject.Inject
+
+@AndroidEntryPoint
+class TvBrowseFragment : BrowseSupportFragment() {
+
+    private val rowsAdapter = ArrayObjectAdapter(ListRowPresenter())
+    private val historyViewModel: WatchHistoryViewModel by viewModels()
+    private val epgViewModel: EpgViewModel by viewModels()
+    private val focusCoordinator = TvFocusCoordinator()
+
+    @Inject
+    lateinit var channelRepository: ChannelRepository
+
+    @Inject
+    lateinit var parentalGatekeeper: ParentalGatekeeper
+
+    @Inject
+    lateinit var channelOrganizationRepository: ChannelOrganizationRepository
+
+    private val rowMap = mutableMapOf<Long, Int>()
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        headersState = HEADERS_ENABLED
+        isHeadersTransitionOnBackEnabled = true
+        title = getString(R.string.app_name)
+        brandColor = ContextCompat.getColor(requireContext(), R.color.tv_brand_color)
+        adapter = rowsAdapter
+    }
+
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        super.onViewCreated(view, savedInstanceState)
+
+        onItemViewClickedListener = OnItemViewClickedListener { itemViewHolder, item, _, _ ->
+            itemViewHolder?.view?.let { focusCoordinator.recordFocus(it) }
+            when (item) {
+                is Channel -> launchPlayer(item.channelIdentity, item.title, item.logoUrl, item.groupTitle, 0L)
+                is WatchHistory -> launchPlayer(item.url, item.title, item.logoUrl, item.groupTitle, item.resumePositionMs)
+            }
+        }
+
+        observeRows()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        focusCoordinator.restoreFocus(view)
+    }
+
+    private fun observeRows() {
+        val isLowEnd = DeviceCapabilityProfile.isLowEndHardware(requireContext())
+        val maxChannelPerGroup = if (isLowEnd) 15 else 25
+        val maxGroups = if (isLowEnd) 8 else 15
+
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewLifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {
+                historyViewModel.continueWatching.collectLatest { items ->
+                    val allowed = items.filterNot {
+                        parentalGatekeeper.isCategoryRestricted(it.groupTitle) ||
+                            parentalGatekeeper.isTargetRestricted(it.url)
+                    }
+                    if (allowed.isNotEmpty()) {
+                        upsertRow(ROW_CONTINUE, "Continue Watching", allowed.take(10))
+                    } else {
+                        removeRow(ROW_CONTINUE)
+                    }
+                }
+            }
+        }
+
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewLifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {
+                channelRepository.favorites.collectLatest { items ->
+                    val allowed = items.filterNot { parentalGatekeeper.isChannelRestricted(it) }
+                    if (allowed.isNotEmpty()) {
+                        upsertRow(ROW_FAVORITES, "Favourites", allowed.take(maxChannelPerGroup))
+                    } else {
+                        removeRow(ROW_FAVORITES)
+                    }
+                }
+            }
+        }
+
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewLifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {
+                channelRepository.recents.collectLatest { items ->
+                    val allowed = items.filterNot { parentalGatekeeper.isChannelRestricted(it) }
+                    if (allowed.isNotEmpty()) {
+                        upsertRow(ROW_RECENTS, "Recently Watched", allowed.take(maxChannelPerGroup))
+                    } else {
+                        removeRow(ROW_RECENTS)
+                    }
+                }
+            }
+        }
+
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewLifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {
+                channelRepository.distinctGroups.collectLatest { groups ->
+                    val visibleGroups = groups.filterNot { parentalGatekeeper.isCategoryRestricted(it) }.take(maxGroups)
+                    visibleGroups.forEachIndexed { i, groupName ->
+                        val rowId = CATEGORY_ROW_BASE + i
+                        val organized = channelOrganizationRepository.getOrganizedChannels(
+                            groupFilter = groupName,
+                            includeHidden = false
+                        ).map { org ->
+                            org.channel.copy(
+                                title = org.displayTitle,
+                                groupTitle = org.displayGroup,
+                                logoUrl = org.displayLogo,
+                                channelNumber = org.displayNumber
+                            )
+                        }.filterNot { parentalGatekeeper.isChannelRestricted(it) }
+                            .take(maxChannelPerGroup)
+
+                        if (organized.isNotEmpty()) {
+                            upsertRow(rowId, groupName, organized)
+                        } else {
+                            removeRow(rowId)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private fun upsertRow(rowId: Long, header: String, items: List<Any>) {
+        val presenter = TvChannelPresenter(epgViewModel)
+        val itemAdapter = ArrayObjectAdapter(presenter).also { a ->
+            items.forEach { a.add(it) }
+        }
+        val row = ListRow(rowId, HeaderItem(rowId, header), itemAdapter)
+        val existing = rowMap[rowId]
+        if (existing != null && existing < rowsAdapter.size()) {
+            rowsAdapter.replace(existing, row)
+        } else {
+            val pos = when (rowId) {
+                ROW_CONTINUE  -> 0
+                ROW_FAVORITES -> minOf(1, rowsAdapter.size())
+                ROW_RECENTS   -> minOf(2, rowsAdapter.size())
+                else          -> rowsAdapter.size()
+            }
+            rowsAdapter.add(pos, row)
+            rebuildRowMap()
+        }
+    }
+
+    private fun removeRow(rowId: Long) {
+        val pos = rowMap[rowId] ?: return
+        if (pos < rowsAdapter.size()) {
+            rowsAdapter.removeItems(pos, 1)
+            rebuildRowMap()
+        }
+    }
+
+    private fun rebuildRowMap() {
+        rowMap.clear()
+        (0 until rowsAdapter.size()).forEach { i ->
+            (rowsAdapter.get(i) as? ListRow)?.let { rowMap[it.id] = i }
+        }
+    }
+
+    private fun launchPlayer(url: String, title: String, logo: String?, group: String?, resumeMs: Long) {
+        startActivity(Intent(requireContext(), TvPlaybackActivity::class.java).apply {
+            putExtra(TvPlaybackActivity.EXTRA_URL, url)
+            putExtra(TvPlaybackActivity.EXTRA_TITLE, title)
+            putExtra(TvPlaybackActivity.EXTRA_LOGO, logo)
+            putExtra(TvPlaybackActivity.EXTRA_RESUME_MS, resumeMs)
+            putExtra("group_title", group)
+        })
+    }
+
+    companion object {
+        const val ROW_CONTINUE      = 1L
+        const val ROW_FAVORITES     = 2L
+        const val ROW_RECENTS       = 3L
+        const val CATEGORY_ROW_BASE = 100L
+    }
+}
+"""
+}
+
+
+def main() -> None:
+    if not BASE_DIR.exists():
+        raise SystemExit(f"Target directory does not exist: {BASE_DIR}")
+
+    for rel_path, content in FILES.items():
+        target = BASE_DIR / rel_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+        print(f"Updated: {target}")
+
+    print(f"Done. Wrote {len(FILES)} files.")
+
+
+if __name__ == "__main__":
+    main()
 ```
 
-#### `tv/dialog/TvChannelActionMenuDialog.kt` — Convert constructor args to no-arg constructor + `Bundle` / FragmentResult safety
-```kotlin
+May I proceed with **Batch 7 (5 classes — Android TV Playback/Surfing & Encrypted Backup)** (`player/surfing/ChannelSurfingCoordinator.kt`, `tv/TvPlaybackActivity.kt`, `tv/dialog/TvChannelActionMenuDialog.kt`, `backup/model/BackupModels.kt`, `backup/ui/BackupCreateDialogFragment.kt`)?
+
+Here is the Python script for **Batch 7 (5 classes — TV Playback/Surfing & Backup Models/Dialog)**:
+
+1. `player/surfing/ChannelSurfingCoordinator.kt` — Syncs `navController.updateChannelList` on channel switches and prevents `FastChannelZapper` from pre-warming unresolved `/X-AUTH-INJECT/` or `xtream://` URLs.
+2. `tv/TvPlaybackActivity.kt` — Wires `ChannelSurfingCoordinator` and `TvKeyNavigationHandler` for D-pad/number-pad channel surfing and uses safe `stopService(...)` in `onDestroy()`.
+3. `tv/dialog/TvChannelActionMenuDialog.kt` — Uses a rotation-safe no-arg constructor with `Bundle` arguments.
+4. `backup/model/BackupModels.kt` — Adds `isFavorite` to `ChannelOverrideBackupDto` and `isUserCreated` to `CustomGroupBackupDto`.
+5. `backup/ui/BackupCreateDialogFragment.kt` — Preserves `targetPassphrase` across configuration changes via `onSaveInstanceState`.
+
+```python
+#!/usr/bin/env python3
+from pathlib import Path
+
+BASE_DIR = Path("/home/username/AndroidStudioProjects/Ytvmate/app/src/main/java/vid/mat/app")
+
+FILES = {
+    "player/surfing/ChannelSurfingCoordinator.kt": """package vid.mat.app.player.surfing
+
+import android.view.KeyEvent
+import android.view.ViewGroup
+import androidx.appcompat.app.AppCompatActivity
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
+import vid.mat.app.data.PlayMode
+import vid.mat.app.data.model.Channel
+import vid.mat.app.data.repository.ChannelOrganizationRepository
+import vid.mat.app.data.repository.ChannelRepository
+import vid.mat.app.epg.EpgViewModel
+import vid.mat.app.navigation.ChannelNavigationController
+import vid.mat.app.network.OkHttpStreamingClient
+import vid.mat.app.player.FastChannelZapper
+import vid.mat.app.player.NewPlayer
+import vid.mat.app.ui.player.LiveTvOsdController
+import vid.mat.app.util.AppLogger
+
+class ChannelSurfingCoordinator(
+    private val activity: AppCompatActivity,
+    private val player: NewPlayer,
+    private val channelRepository: ChannelRepository,
+    private val organizationRepository: ChannelOrganizationRepository?,
+    private val epgViewModel: EpgViewModel?,
+    private val osdContainer: ViewGroup
+) {
+
+    companion object {
+        private const val TAG = "ChannelSurfingCoordinator"
+    }
+
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+    private val zapper = FastChannelZapper(activity.applicationContext)
+    private val navController = ChannelNavigationController(
+        player, channelRepository, organizationRepository,
+        scope = scope
+    )
+
+    private val osdController = LiveTvOsdController(
+        activity = activity,
+        container = osdContainer,
+        onChannelSelected = { selected -> switchChannel(selected) },
+        epgViewModel = epgViewModel
+    )
+
+    private var activeChannelsList: List<Channel> = emptyList()
+    private var currentChannelIndex: Int = -1
+    private var preWarmJob: Job? = null
+
+    private val _currentChannel = MutableStateFlow<Channel?>(null)
+    val currentChannel: StateFlow<Channel?> = _currentChannel.asStateFlow()
+
+    fun initialize(initialChannelIdentity: String?) {
+        scope.launch {
+            val organized = organizationRepository?.getOrganizedChannels(includeHidden = false)
+            val channels = if (!organized.isNullOrEmpty()) {
+                organized.map { it.channel }
+            } else {
+                channelRepository.getAllChannels(50_000)
+            }
+
+            activeChannelsList = channels
+            val initialIndex = channels.indexOfFirst { it.channelIdentity == initialChannelIdentity }
+            currentChannelIndex = if (initialIndex >= 0) initialIndex else 0
+
+            navController.updateChannelList(channels, channels.getOrNull(currentChannelIndex)?.channelId)
+
+            val active = channels.getOrNull(currentChannelIndex)
+            _currentChannel.value = active
+
+            AppLogger.i(TAG, "Surfing coordinator initialized with ${channels.size} channels. Active: ${active?.title}")
+            preWarmAdjacentChannels()
+        }
+    }
+
+    fun nextChannel() {
+        if (activeChannelsList.isEmpty()) return
+        val nextIdx = (currentChannelIndex + 1) % activeChannelsList.size
+        switchToIndex(nextIdx)
+    }
+
+    fun previousChannel() {
+        if (activeChannelsList.isEmpty()) return
+        val prevIdx = if (currentChannelIndex - 1 < 0) activeChannelsList.size - 1 else currentChannelIndex - 1
+        switchToIndex(prevIdx)
+    }
+
+    fun toggleLastChannel() {
+        navController.toggleLastChannel()
+    }
+
+    fun showQuickChannelOsd() {
+        if (activeChannelsList.isNotEmpty()) {
+            osdController.showOsd(activeChannelsList, currentChannelIndex)
+        }
+    }
+
+    fun handleKeyEvent(event: KeyEvent): Boolean {
+        if (event.action != KeyEvent.ACTION_DOWN) return false
+
+        return when (event.keyCode) {
+            KeyEvent.KEYCODE_DPAD_UP,
+            KeyEvent.KEYCODE_CHANNEL_UP -> {
+                nextChannel()
+                true
+            }
+            KeyEvent.KEYCODE_DPAD_DOWN,
+            KeyEvent.KEYCODE_CHANNEL_DOWN -> {
+                previousChannel()
+                true
+            }
+            KeyEvent.KEYCODE_0, KeyEvent.KEYCODE_1, KeyEvent.KEYCODE_2,
+            KeyEvent.KEYCODE_3, KeyEvent.KEYCODE_4, KeyEvent.KEYCODE_5,
+            KeyEvent.KEYCODE_6, KeyEvent.KEYCODE_7, KeyEvent.KEYCODE_8,
+            KeyEvent.KEYCODE_9 -> {
+                val digit = event.keyCode - KeyEvent.KEYCODE_0
+                osdController.handleDigitKey(digit, activeChannelsList)
+                navController.onDigitKey(digit)
+                true
+            }
+            KeyEvent.KEYCODE_LAST_CHANNEL,
+            KeyEvent.KEYCODE_MEDIA_PREVIOUS -> {
+                toggleLastChannel()
+                true
+            }
+            KeyEvent.KEYCODE_DPAD_LEFT,
+            KeyEvent.KEYCODE_MENU,
+            KeyEvent.KEYCODE_TV_CONTENTS_MENU -> {
+                showQuickChannelOsd()
+                true
+            }
+            else -> false
+        }
+    }
+
+    private fun switchToIndex(index: Int) {
+        val target = activeChannelsList.getOrNull(index) ?: return
+        currentChannelIndex = index
+        switchChannel(target)
+    }
+
+    private fun switchChannel(channel: Channel) {
+        AppLogger.i(TAG, "Zapping to channel: ${channel.title} (#${channel.channelNumber ?: (currentChannelIndex + 1)})")
+        _currentChannel.value = channel
+        navController.updateChannelList(activeChannelsList, channel.channelId)
+        player.playStream(channel.channelIdentity, PlayMode.FULLSCREEN_VIDEO)
+        preWarmAdjacentChannels()
+    }
+
+    private fun preWarmAdjacentChannels() {
+        preWarmJob?.cancel()
+        preWarmJob = scope.launch(Dispatchers.IO) {
+            delay(250)
+
+            if (activeChannelsList.size < 2 || currentChannelIndex < 0) return@launch
+
+            val nextIdx = (currentChannelIndex + 1) % activeChannelsList.size
+            val nextChannel = activeChannelsList.getOrNull(nextIdx) ?: return@launch
+
+            val endpoints = channelRepository.getEndpointsForChannel(nextChannel.channelId)
+            val primaryEndpoint = endpoints.firstOrNull() ?: return@launch
+            if (primaryEndpoint.url.contains("/X-AUTH-INJECT/") || primaryEndpoint.url.startsWith("xtream://")) {
+                return@launch
+            }
+
+            val headers = OkHttpStreamingClient.StreamHeaders(
+                userAgent = primaryEndpoint.userAgent,
+                referer = primaryEndpoint.referer?.value,
+                cookie = primaryEndpoint.cookie?.value,
+                authorization = primaryEndpoint.authorization?.value
+            )
+
+            AppLogger.d(TAG, "FastZapper pre-warming next adjacent channel: ${nextChannel.title}")
+            zapper.preWarm(primaryEndpoint.url, headers)
+        }
+    }
+
+    fun destroy() {
+        preWarmJob?.cancel()
+        zapper.release()
+        scope.cancel()
+    }
+}
+""",
+
+    "tv/TvPlaybackActivity.kt": """package vid.mat.app.tv
+
+import android.content.Intent
+import android.os.Build
+import android.os.Bundle
+import android.view.KeyEvent
+import android.view.ViewGroup
+import android.view.WindowManager
+import androidx.activity.OnBackPressedCallback
+import androidx.annotation.OptIn
+import androidx.appcompat.app.AppCompatActivity
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.SavedStateHandle
+import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.repeatOnLifecycle
+import androidx.media3.common.Player
+import androidx.media3.common.util.UnstableApi
+import dagger.hilt.android.AndroidEntryPoint
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import vid.mat.app.data.repository.ChannelOrganizationRepository
+import vid.mat.app.data.repository.ChannelRepository
+import vid.mat.app.history.WatchHistoryRepository
+import vid.mat.app.lifecycle.PlayerSavedStateRestorer
+import vid.mat.app.player.AutoFrameRateManager
+import vid.mat.app.player.NewPlayerImpl
+import vid.mat.app.player.surfing.ChannelSurfingCoordinator
+import vid.mat.app.profile.ActiveProfileProvider
+import vid.mat.app.ui.player.PlayerMediaData
+import vid.mat.app.uimodel.NewPlayerViewModel
+import vid.mat.app.util.PlaybackService
+import vid.mat.app.util.SensitiveDataSanitizer
+import javax.inject.Inject
+
+@AndroidEntryPoint
+@OptIn(UnstableApi::class)
+class TvPlaybackActivity : AppCompatActivity() {
+
+    companion object {
+        private const val TAG            = "TvPlaybackActivity"
+        const val EXTRA_URL       = "tv_url"
+        const val EXTRA_TITLE     = "tv_title"
+        const val EXTRA_LOGO      = "tv_logo"
+        const val EXTRA_RESUME_MS = "tv_resume_ms"
+    }
+
+    private lateinit var viewModel: NewPlayerViewModel
+    private var currentMediaData: PlayerMediaData? = null
+    private var hasSentStartIntent = false
+    private var lastAttachedPlayer: Player? = null
+    private var positionSaveJob: Job? = null
+    private var surfingCoordinator: ChannelSurfingCoordinator? = null
+
+    @Inject
+    lateinit var activeProfileProvider: ActiveProfileProvider
+
+    @Inject
+    lateinit var watchHistoryRepo: WatchHistoryRepository
+
+    @Inject
+    lateinit var channelRepository: ChannelRepository
+
+    @Inject
+    lateinit var organizationRepository: ChannelOrganizationRepository
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+
+        viewModel = ViewModelProvider(this)[NewPlayerViewModel::class.java]
+
+        if (savedInstanceState != null) {
+            val handle = SavedStateHandle()
+            for (key in savedInstanceState.keySet()) {
+                handle[key] = savedInstanceState.get(key)
+            }
+            val restored = PlayerSavedStateRestorer.restorePlayerState(handle)
+            if (restored != null) {
+                currentMediaData = restored.mediaData
+                viewModel.setAudioDelay(restored.audioDelayMs)
+                viewModel.setSubtitleDelay(restored.subtitleDelayMs)
+            }
+        }
+
+        if (currentMediaData == null) {
+            val rawUrl = intent.getStringExtra(EXTRA_URL) ?: run { finish(); return }
+            val title = SensitiveDataSanitizer.sanitizeText(intent.getStringExtra(EXTRA_TITLE) ?: "Stream")
+            val logo = intent.getStringExtra(EXTRA_LOGO)
+            val resume = intent.getLongExtra(EXTRA_RESUME_MS, 0L)
+            currentMediaData = PlayerMediaData(
+                mediaPath = rawUrl,
+                mediaTitle = title,
+                thumbnailUrl = logo.orEmpty(),
+                resumePosition = resume,
+                groupTitle = intent.getStringExtra("group_title")
+            )
+        }
+
+        val data = currentMediaData ?: run { finish(); return }
+
+        val videoFragment = TvVideoFragment.newInstance(data.mediaTitle, data.thumbnailUrl)
+        supportFragmentManager.beginTransaction()
+            .replace(android.R.id.content, videoFragment)
+            .commit()
+
+        val rootContainer = findViewById<ViewGroup>(android.R.id.content)
+        surfingCoordinator = ChannelSurfingCoordinator(
+            activity = this,
+            player = viewModel.newPlayer,
+            channelRepository = channelRepository,
+            organizationRepository = organizationRepository,
+            epgViewModel = null,
+            osdContainer = rootContainer
+        ).also {
+            it.initialize(data.mediaPath)
+        }
+
+        onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
+            override fun handleOnBackPressed() {
+                finish()
+            }
+        })
+
+        lifecycleScope.launch {
+            repeatOnLifecycle(Lifecycle.State.STARTED) {
+                viewModel.newPlayer.exoPlayer.collect { player ->
+                    if (player != null && player !== lastAttachedPlayer) {
+                        lastAttachedPlayer = player
+                        videoFragment.attachPlayer(player, data.mediaTitle)
+                    }
+                }
+            }
+        }
+
+        if (!hasSentStartIntent) {
+            hasSentStartIntent = true
+            val activeMediaId = viewModel.newPlayer.currentSession.value?.mediaId
+            if (activeMediaId != data.mediaPath || viewModel.newPlayer.exoPlayer.value == null) {
+                startPlaybackService(data)
+            }
+        }
+    }
+
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        if (TvKeyNavigationHandler.dispatchKeyEvent(event, surfingCoordinator)) {
+            return true
+        }
+        return super.dispatchKeyEvent(event)
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        val handle = SavedStateHandle()
+        val pos = viewModel.newPlayer.exoPlayer.value?.currentPosition ?: currentMediaData?.resumePosition ?: 0L
+        val audioDelay = viewModel.uiState.value.audioDelayMs
+        val subDelay = viewModel.uiState.value.subtitleDelayMs
+
+        PlayerSavedStateRestorer.savePlayerState(
+            handle = handle,
+            session = viewModel.newPlayer.currentSession.value,
+            data = currentMediaData,
+            currentPositionMs = pos,
+            audioDelayMs = audioDelay,
+            subtitleDelayMs = subDelay,
+            profileId = activeProfileProvider.activeProfile.value.id
+        )
+        for (key in handle.keys()) {
+            val value = handle.get<Any>(key)
+            when (value) {
+                is String -> outState.putString(key, value)
+                is Long -> outState.putLong(key, value)
+                is Int -> outState.putInt(key, value)
+            }
+        }
+    }
+
+    private fun startPlaybackService(data: PlayerMediaData) {
+        val serviceIntent = Intent(this, PlaybackService::class.java).apply {
+            action = PlaybackService.ACTION_START_PLAYBACK
+            putExtra(PlaybackService.EXTRA_MEDIA_PATH, data.mediaPath)
+            putExtra(PlaybackService.EXTRA_MEDIA_TITLE, data.mediaTitle)
+            putExtra(PlaybackService.EXTRA_THUMBNAIL_URI, data.thumbnailUrl)
+            putExtra(PlaybackService.EXTRA_RESUME_POSITION, data.resumePosition)
+        }
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            startForegroundService(serviceIntent)
+        } else {
+            startService(serviceIntent)
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        setupPositionSaver()
+        AutoFrameRateManager.onActivityResumed(this)
+        (viewModel.newPlayer as? NewPlayerImpl)?.playbackIntelligence?.bindActivity(this)
+    }
+
+    override fun onPause() {
+        super.onPause()
+        positionSaveJob?.cancel()
+        saveWatchProgress()
+        (viewModel.newPlayer as? NewPlayerImpl)?.playbackIntelligence?.bindActivity(null)
+        AutoFrameRateManager.onActivityPaused(this)
+    }
+
+    private fun setupPositionSaver() {
+        positionSaveJob?.cancel()
+        positionSaveJob = lifecycleScope.launch {
+            while (isActive) {
+                delay(15_000L)
+                saveWatchProgress()
+            }
+        }
+    }
+
+    private fun saveWatchProgress() {
+        val player = viewModel.newPlayer.exoPlayer.value ?: return
+        val data = currentMediaData ?: return
+        if (data.mediaPath.isNotBlank()) {
+            val pos = player.currentPosition
+            val dur = player.duration.takeIf { it > 0L } ?: 0L
+            lifecycleScope.launch(Dispatchers.IO) {
+                watchHistoryRepo.record(
+                    url        = data.mediaPath,
+                    title      = data.mediaTitle,
+                    logoUrl    = data.thumbnailUrl.takeIf { it.isNotBlank() },
+                    groupTitle = data.groupTitle,
+                    positionMs = pos,
+                    durationMs = dur
+                )
+            }
+        }
+    }
+
+    override fun onStop() {
+        super.onStop()
+        AutoFrameRateManager.onActivityStopped(this)
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        positionSaveJob?.cancel()
+        surfingCoordinator?.destroy()
+        surfingCoordinator = null
+        lastAttachedPlayer = null
+        AutoFrameRateManager.cleanupActivity(this)
+
+        if (isFinishing) {
+            stopService(Intent(this, PlaybackService::class.java))
+        }
+    }
+}
+""",
+
+    "tv/dialog/TvChannelActionMenuDialog.kt": """package vid.mat.app.tv.dialog
+
+import android.app.Dialog
+import android.os.Bundle
+import androidx.fragment.app.DialogFragment
+import com.google.android.material.dialog.MaterialAlertDialogBuilder
+import vid.mat.app.data.model.Channel
+
 class TvChannelActionMenuDialog : DialogFragment() {
 
     var onPlay: (() -> Unit)? = null
@@ -2777,30 +2009,41 @@ class TvChannelActionMenuDialog : DialogFragment() {
         }
     }
 }
-```
+""",
 
----
+    "backup/model/BackupModels.kt": """package vid.mat.app.backup.model
 
-### Phase 13 Completion Notes
-- **Completed in code above**:
-  - Fixed `TvChannelPresenter.kt` compilation errors (missing `VodMovieEntity`, `SeriesEntity`, `SearchItem` imports) and added Now/Next EPG display for `Channel` cards.
-  - Fixed `TvVodBrowseFragment` and `TvSeriesBrowseFragment` so category rows are actually populated with movies and series (and filtered through `ParentalGatekeeper`).
-  - Fixed `TvSearchFragment` to handle `LiveChannelItem` identity, `VodMovieItem` details navigation, and `SeriesItem` details navigation.
-  - Connected `ChannelSurfingCoordinator` and `TvKeyNavigationHandler` into `TvPlaybackActivity`, synced `ChannelNavigationController` active channel index on switch, prevented `FastChannelZapper` from sending unauthenticated `X-AUTH-INJECT` URLs, and switched `onDestroy` to safe `stopService(...)`.
-  - Connected `TvFocusCoordinator` and `ChannelOrganizationRepository` into `TvBrowseFragment`, with `ParentalGatekeeper` filtering.
-  - Converted `TvChannelActionMenuDialog` to a no-arg constructor + `Bundle` arguments.
+import com.google.gson.annotations.SerializedName
 
-Confirm when you are ready to proceed to **Phase 14 — Backup, restoration, security, and parental controls**.
-Below are **only the new or modified methods, attributes, and targeted edits** for **Phase 14 — Backup, Restoration, Security, and Parental Controls**.
+data class BackupHeader(
+    @SerializedName("magic") val magic: String = "IPTV_BACKUP_V1",
+    @SerializedName("version") val version: Int = 2,
+    @SerializedName("created_at_ms") val createdAtMs: Long = System.currentTimeMillis(),
+    @SerializedName("app_version") val appVersion: String = "1.0.0",
+    @SerializedName("is_encrypted") val isEncrypted: Boolean = true,
+    @SerializedName("salt_base64") val saltBase64: String = "",
+    @SerializedName("iv_base64") val ivBase64: String = ""
+)
 
-*(No full classes are repeated.)*
+data class BackupPayload(
+    @SerializedName("sources") val sources: List<PlaylistSourceBackupDto> = emptyList(),
+    @SerializedName("channels") val channels: List<ChannelBackupDto> = emptyList(),
+    @SerializedName("overrides") val overrides: List<ChannelOverrideBackupDto> = emptyList(),
+    @SerializedName("custom_groups") val customGroups: List<CustomGroupBackupDto> = emptyList(),
+    @SerializedName("profiles") val profiles: List<ProfileBackupDto> = emptyList(),
+    @SerializedName("history") val history: List<WatchHistoryBackupDto> = emptyList(),
+    @SerializedName("favorites") val favorites: List<FavoriteBackupDto> = emptyList(),
+    @SerializedName("xtream_accounts") val xtreamAccounts: List<XtreamAccountBackupDto> = emptyList()
+)
 
----
+data class PlaylistSourceBackupDto(
+    val name: String,
+    val type: String,
+    val sourceUrl: String,
+    val epgUrl: String? = null,
+    val xtreamAccountKey: String? = null
+)
 
-### 1. Encrypted Backup Completeness, Rotation Safety & Profile Integrity (`EncryptedBackupManager.kt`, `BackupModels.kt`, `BackupCreateDialogFragment.kt`)
-
-#### `backup/model/BackupModels.kt` — Add `isUserCreated` to `CustomGroupBackupDto` and `isFavorite` to `ChannelOverrideBackupDto` (with defaults for backward compatibility)
-```kotlin
 data class ChannelOverrideBackupDto(
     val channelIdentity: String,
     val customTitle: String? = null,
@@ -2818,556 +2061,3776 @@ data class CustomGroupBackupDto(
     val isHidden: Boolean = false,
     val isUserCreated: Boolean = true
 )
-```
 
-#### `backup/EncryptedBackupManager.kt` — Preserve hidden custom groups, clean profile merge without orphan/duplicate `isDefault` rows, and skip stale VOD/Series row IDs on cross-device restore
-```kotlin
-// Inside exportBackup(...), export all customGroups (including hidden ones) and override isFavorite:
-val overrides = overrideDao.getAll().map {
-    ChannelOverrideBackupDto(
-        it.channelIdentity,
-        it.customTitle,
-        it.customGroupTitle,
-        it.customLogoUrl,
-        it.customChannelNumber,
-        it.userOrderIndex,
-        it.isHidden,
-        it.isFavorite
-    )
-}
-val customGroups = runCatching { groupDao.getAllFlow().first() }.getOrDefault(emptyList())
-    .map { CustomGroupBackupDto(it.name, it.sortOrder, it.isHidden, it.isUserCreated) }
+data class ProfileBackupDto(
+    val sourceProfileId: Long = 0L,
+    val name: String,
+    val avatarColorHex: String,
+    val avatarIconName: String = "ic_profile_default",
+    val isKidsProfile: Boolean,
+    val isProtected: Boolean,
+    val pinHash: String? = null,
+    val isDefault: Boolean = false
+)
 
-// Inside importBackup(...), replace overrides / customGroups / profiles / favorites / history restore blocks:
-payload.overrides.forEach { o ->
-    val mappedIdentity = identityRemap[o.channelIdentity] ?: o.channelIdentity
-    overrideDao.upsert(
-        ChannelUserOverrideEntity(
-            channelIdentity = mappedIdentity,
-            customTitle = o.customTitle,
-            customGroupTitle = o.customGroupTitle,
-            customLogoUrl = o.customLogoUrl,
-            customChannelNumber = o.customChannelNumber,
-            userOrderIndex = o.userOrderIndex,
-            isHidden = o.isHidden,
-            isFavorite = o.isFavorite
-        )
-    )
-    restoredOverrides++
-}
-payload.customGroups.forEach { g ->
-    groupDao.insert(
-        CustomGroupEntity(
-            name = g.name,
-            sortOrder = g.sortOrder,
-            isHidden = g.isHidden,
-            isUserCreated = g.isUserCreated
-        )
-    )
-}
+data class FavoriteBackupDto(
+    val targetId: String,
+    val profileId: Long,
+    val type: String,
+    val title: String,
+    val subtitle: String? = null,
+    val groupTitle: String? = null,
+    val logoUrl: String? = null,
+    val streamUrl: String,
+    val customFavoriteGroup: String? = null,
+    val userOrder: Int = 0,
+    val createdAtMs: Long = 0L
+)
 
-// Match existing profiles by name before inserting so we do not trigger OnConflictStrategy.REPLACE
-// and orphan existing profile-scoped rows or leave multiple `isDefault = 1` profiles:
-val existingProfilesByName = profileDao.getAllProfiles().associateBy { it.name.trim().lowercase() }
-if (payload.profiles.any { it.isDefault }) {
-    profileDao.clearDefaultFlags()
-}
-payload.profiles.forEach { p ->
-    if (p.isProtected && !isValidProfileVerifier(p.pinHash)) {
-        throw IllegalArgumentException("Backup contains an invalid verifier for protected profile '${p.name}'")
-    }
-    val existing = existingProfilesByName[p.name.trim().lowercase()]
-    val restoredId = if (existing != null) {
-        profileDao.update(
-            existing.copy(
-                avatarColorHex = p.avatarColorHex,
-                avatarIconName = p.avatarIconName,
-                isKidsProfile = p.isKidsProfile,
-                isProtected = p.isProtected,
-                pinHash = p.pinHash,
-                isDefault = p.isDefault
-            )
-        )
-        existing.id
-    } else {
-        profileDao.insert(
-            ProfileEntity(
-                name = p.name,
-                avatarColorHex = p.avatarColorHex,
-                avatarIconName = p.avatarIconName,
-                isKidsProfile = p.isKidsProfile,
-                isProtected = p.isProtected,
-                pinHash = p.pinHash,
-                isDefault = p.isDefault
-            )
-        )
-    }
-    if (restoredId > 0L) {
-        restoredProfileIds[p.sourceProfileId] = restoredId
-        if (p.sourceProfileId <= 0L) restoredProfileIds.putIfAbsent(1L, restoredId)
-        if (p.isDefault || restoredDefaultProfileId == null) {
-            restoredDefaultProfileId = restoredId
+data class WatchHistoryBackupDto(
+    val mediaKey: String,
+    val mediaTitle: String,
+    val streamUrl: String,
+    val positionMs: Long,
+    val durationMs: Long,
+    val completionPercent: Int,
+    val profileId: Long = 1L,
+    val contentType: String = "LIVE_TV",
+    val mediaSubtitle: String? = null,
+    val thumbnailUrl: String? = null,
+    val seriesId: Long? = null,
+    val seasonNumber: Int? = null,
+    val episodeNumber: Int? = null,
+    val lastWatchedTimestampMs: Long = 0L,
+    val isCompleted: Boolean = false
+)
+
+data class XtreamAccountBackupDto(
+    val serverUrl: String,
+    val username: String,
+    val encryptedPassBase64: String = "",
+    val ivBase64: String = "",
+    val password: String? = null
+)
+
+data class BackupExportSummary(
+    val sourcesCount: Int,
+    val channelsCount: Int,
+    val overridesCount: Int,
+    val historyCount: Int,
+    val profilesCount: Int,
+    val totalBytesWritten: Long
+)
+
+data class BackupRestoreSummary(
+    val restoredSources: Int,
+    val restoredChannels: Int,
+    val restoredOverrides: Int,
+    val restoredProfiles: Int,
+    val restoredHistory: Int,
+    val restoredFavorites: Int = 0
+)
+
+data class StreamEndpointBackupDto(
+    val url: String,
+    val priority: Int = 0,
+    val containerFormat: String? = "m3u8",
+    val resolutionLabel: String? = "Auto",
+    val userAgent: String? = null,
+    val referer: String? = null,
+    val cookie: String? = null,
+    val authorization: String? = null
+)
+
+data class ChannelBackupDto(
+    val channelIdentity: String,
+    val sourceId: Long = 0L,
+    val sourceUrl: String = "",
+    val sourceType: String = "M3U_REMOTE",
+    val externalId: String? = null,
+    val channelNumber: Int? = null,
+    val title: String,
+    val logoUrl: String? = null,
+    val groupTitle: String? = null,
+    val tvgId: String? = null,
+    val tvgName: String? = null,
+    val isFavorite: Boolean = false,
+    val userOrder: Int = 0,
+    val catchupDays: Int = 0,
+    val catchupSource: String? = null,
+    val lastPlayedAtMs: Long? = null,
+    val createdAtMs: Long = 0L,
+    val updatedAtMs: Long = 0L,
+    val endpoints: List<StreamEndpointBackupDto> = emptyList()
+)
+""",
+
+    "backup/ui/BackupCreateDialogFragment.kt": """package vid.mat.app.backup.ui
+
+import android.app.Activity
+import android.content.Intent
+import android.net.Uri
+import android.os.Bundle
+import android.view.LayoutInflater
+import android.view.View
+import android.view.ViewGroup
+import android.widget.Toast
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.fragment.app.DialogFragment
+import androidx.lifecycle.lifecycleScope
+import dagger.hilt.android.AndroidEntryPoint
+import kotlinx.coroutines.launch
+import vid.mat.app.backup.EncryptedBackupManager
+import vid.mat.app.databinding.DialogBackupCreateBinding
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import javax.inject.Inject
+
+@AndroidEntryPoint
+class BackupCreateDialogFragment : DialogFragment() {
+
+    private var _binding: DialogBackupCreateBinding? = null
+    private val binding get() = _binding!!
+
+    @Inject
+    lateinit var backupManager: EncryptedBackupManager
+
+    private var targetPassphrase: String? = null
+
+    private val saveFileLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        if (result.resultCode == Activity.RESULT_OK) {
+            result.data?.data?.let { uri ->
+                performExport(uri)
+            }
         }
     }
-    restoredProfiles++
-}
 
-payload.favorites.forEach { f ->
-    val restoredProfileId = restoredProfileIds[f.profileId] ?: return@forEach
-    val type = runCatching { FavoriteType.valueOf(f.type) }.getOrNull() ?: return@forEach
-    // Skip VOD_MOVIE / SERIES favorites that reference local SQLite row IDs not included in backups
-    if ((type == FavoriteType.VOD_MOVIE || type == FavoriteType.SERIES) &&
-        (f.targetId.startsWith("movie_") || f.targetId.startsWith("series_"))
-    ) {
-        return@forEach
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        targetPassphrase = savedInstanceState?.getString(KEY_PASSPHRASE)
     }
-    val remappedTarget = if (f.targetId.startsWith("live_identity:")) {
-        val oldId = f.targetId.removePrefix("live_identity:")
-        "live_identity:${identityRemap[oldId] ?: oldId}"
-    } else {
-        f.targetId
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        outState.putString(KEY_PASSPHRASE, targetPassphrase)
     }
-    favoriteDao.upsert(
-        UnifiedFavoriteEntity(
-            targetId = remappedTarget,
-            profileId = restoredProfileId,
-            type = type,
-            title = f.title,
-            subtitle = f.subtitle,
-            groupTitle = f.groupTitle,
-            logoUrl = f.logoUrl,
-            streamUrl = f.streamUrl,
-            customFavoriteGroup = f.customFavoriteGroup,
-            userOrder = f.userOrder,
-            createdAtMs = f.createdAtMs.takeIf { it > 0 } ?: System.currentTimeMillis()
-        )
-    )
-    restoredFavorites++
-}
-```
 
-#### `backup/ui/BackupCreateDialogFragment.kt` — Preserve `targetPassphrase` across rotation via `onSaveInstanceState`
-```kotlin
-companion object {
-    const val TAG = "BackupCreateDialogFragment"
-    private const val KEY_PASSPHRASE = "state_target_passphrase"
-    fun newInstance() = BackupCreateDialogFragment()
-}
-
-override fun onCreate(savedInstanceState: Bundle?) {
-    super.onCreate(savedInstanceState)
-    targetPassphrase = savedInstanceState?.getString(KEY_PASSPHRASE)
-}
-
-override fun onSaveInstanceState(outState: Bundle) {
-    super.onSaveInstanceState(outState)
-    outState.putString(KEY_PASSPHRASE, targetPassphrase)
-}
-```
-
----
-
-### 2. Parental Control Enforcement Across Remaining Entry Points & Pattern Filtering (`ParentalControlManager.kt`, `EpgProgramDetailsBottomSheet.kt`, `FavoritesFragment.kt`, `UnifiedHistoryFragment.kt`, `HomeDashboardFragment.kt`)
-
-#### `security/ParentalControlManager.kt` — Enforce `isAdultPattern` for default adult protection when category locking is active
-```kotlin
-fun isCategoryRestricted(categoryName: String): Boolean {
-    val cat = categoryName.trim().lowercase()
-    if (cat.isBlank()) return false
-    val locked = getLockedCategories()
-    if (locked.contains(cat)) return true
-
-    val customBlocked = getCustomBlockedKeywords()
-    if (customBlocked.any { cat.contains(it) }) return true
-
-    return isAdultPattern(cat)
-}
-```
-
-#### `ui/epg/EpgProgramDetailsBottomSheet.kt` — Enforce `ParentalGatekeeper` before tuning or catch-up playback
-```kotlin
-@Inject
-lateinit var parentalGatekeeper: vid.mat.app.security.ParentalGatekeeper
-
-private var pendingParentalAction: (() -> Unit)? = null
-
-// Register FragmentResultListener inside onViewCreated(...):
-childFragmentManager.setFragmentResultListener(
-    vid.mat.app.ui.security.ParentalPinChallengeDialog.RESULT_KEY,
-    viewLifecycleOwner
-) { _, bundle ->
-    if (bundle.getBoolean(vid.mat.app.ui.security.ParentalPinChallengeDialog.KEY_UNLOCKED, false)) {
-        childFragmentManager.clearFragmentResult(vid.mat.app.ui.security.ParentalPinChallengeDialog.RESULT_KEY)
-        val action = pendingParentalAction
-        pendingParentalAction = null
-        action?.invoke()
+    override fun onCreateView(inflater: LayoutInflater, container: ViewGroup?, savedInstanceState: Bundle?): View {
+        _binding = DialogBackupCreateBinding.inflate(inflater, container, false)
+        return binding.root
     }
-}
 
-private fun tuneChannel(ch: Channel) {
-    if (parentalGatekeeper.isChannelRestricted(ch)) {
-        pendingParentalAction = { executeTuneChannel(ch) }
-        vid.mat.app.ui.security.ParentalPinChallengeDialog.newInstance(
-            title = "Restricted Channel",
-            message = "'${ch.title}' is locked by parental controls."
-        ).show(childFragmentManager, vid.mat.app.ui.security.ParentalPinChallengeDialog.TAG)
-        return
-    }
-    executeTuneChannel(ch)
-}
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        super.onViewCreated(view, savedInstanceState)
 
-private fun executeTuneChannel(ch: Channel) {
-    val intent = Intent(requireContext(), MediaPlayerActivity::class.java).apply {
-        putExtra(MediaPlayerActivity.EXTRA_MEDIA_PATH, ch.channelIdentity)
-        putExtra(MediaPlayerActivity.EXTRA_MEDIA_TITLE, ch.title)
-        putExtra(MediaPlayerActivity.EXTRA_MEDIA_THUMBNAIL, ch.logoUrl)
-        putExtra("group_title", ch.groupTitle)
-    }
-    startActivity(intent)
-    dismiss()
-}
+        binding.btnExport.setOnClickListener {
+            val pass = binding.etPassword.text.toString().trim()
+            val confirm = binding.etConfirmPassword.text.toString().trim()
 
-private fun playCatchup(ch: Channel, prog: EpgProgram) {
-    if (parentalGatekeeper.isChannelRestricted(ch)) {
-        pendingParentalAction = { executePlayCatchup(ch, prog) }
-        vid.mat.app.ui.security.ParentalPinChallengeDialog.newInstance(
-            title = "Restricted Channel",
-            message = "'${ch.title}' is locked by parental controls."
-        ).show(childFragmentManager, vid.mat.app.ui.security.ParentalPinChallengeDialog.TAG)
-        return
-    }
-    executePlayCatchup(ch, prog)
-}
+            if (pass.isBlank()) {
+                Toast.makeText(requireContext(), "A backup passphrase is required", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
+            if (pass != confirm) {
+                Toast.makeText(requireContext(), "Passwords do not match", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
 
-private fun executePlayCatchup(ch: Channel, prog: EpgProgram) {
-    lifecycleScope.launch {
-        val result = unifiedCatchupEngine.resolveCatchupDescriptor(ch.channelId, prog.startMs, prog.stopMs)
-        if (result.isFailure) {
-            Toast.makeText(
-                requireContext(),
-                result.exceptionOrNull()?.message ?: "Catch-up is unavailable for this program.",
-                Toast.LENGTH_LONG
-            ).show()
-            return@launch
+            targetPassphrase = pass
+
+            val timestamp = SimpleDateFormat("yyyyMMdd_HHmm", Locale.US).format(Date())
+            val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
+                addCategory(Intent.CATEGORY_OPENABLE)
+                type = "application/octet-stream"
+                putExtra(Intent.EXTRA_TITLE, "iptv_backup_$timestamp.ytvbk")
+            }
+            saveFileLauncher.launch(intent)
         }
 
-        val catchupId = "catchup_${ch.channelId}_${prog.startMs}_${prog.stopMs}"
+        binding.btnCancel.setOnClickListener { dismiss() }
+    }
+
+    private fun performExport(uri: Uri) {
+        lifecycleScope.launch {
+            binding.btnExport.isEnabled = false
+            binding.btnExport.text = "Exporting..."
+
+            val outputStream = requireContext().contentResolver.openOutputStream(uri)
+            if (outputStream != null) {
+                val result = backupManager.exportBackup(outputStream, targetPassphrase)
+                result.fold(
+                    onSuccess = { summary ->
+                        Toast.makeText(
+                            requireContext(),
+                            "Backup created: ${summary.channelsCount} channels saved",
+                            Toast.LENGTH_LONG
+                        ).show()
+                        dismiss()
+                    },
+                    onFailure = { err ->
+                        Toast.makeText(
+                            requireContext(),
+                            "Export failed: ${err.message}",
+                            Toast.LENGTH_LONG
+                        ).show()
+                        binding.btnExport.isEnabled = true
+                        binding.btnExport.text = "Create Encrypted Backup"
+                    }
+                )
+            } else {
+                Toast.makeText(
+                    requireContext(),
+                    "Unable to open the selected file for writing",
+                    Toast.LENGTH_LONG
+                ).show()
+                binding.btnExport.isEnabled = true
+                binding.btnExport.text = "Create Encrypted Backup"
+            }
+        }
+    }
+
+    override fun onDestroyView() {
+        super.onDestroyView()
+        _binding = null
+    }
+
+    companion object {
+        const val TAG = "BackupCreateDialogFragment"
+        private const val KEY_PASSPHRASE = "state_target_passphrase"
+        fun newInstance() = BackupCreateDialogFragment()
+    }
+}
+"""
+}
+
+
+def main() -> None:
+    if not BASE_DIR.exists():
+        raise SystemExit(f"Target directory does not exist: {BASE_DIR}")
+
+    for rel_path, content in FILES.items():
+        target = BASE_DIR / rel_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+        print(f"Updated: {target}")
+
+    print(f"Done. Wrote {len(FILES)} files.")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+Note: `TvPlaybackActivity.kt` extends `AppCompatActivity()` (compatible with `ChannelSurfingCoordinator(activity: AppCompatActivity, ...)`). Make sure `TvPlaybackActivity` uses an AppCompat theme in `AndroidManifest.xml` (or note that for manifest review).
+
+May I proceed with **Batch 8 (5 classes — Encrypted Backup & Parental Enforcement)** (`backup/EncryptedBackupManager.kt`, `security/ParentalControlManager.kt`, `ui/epg/EpgProgramDetailsBottomSheet.kt`, `favorites/ui/FavoritesFragment.kt`, `history/ui/UnifiedHistoryFragment.kt`)?
+Here is the Python script for **Batch 8 (5 classes — Backup Restoration & Parental Gate Enforcement)**:
+
+1. `backup/EncryptedBackupManager.kt` — Exports hidden custom groups and override `isFavorite`, merges existing profiles by name cleanly, and skips non-portable local VOD/Series IDs during favorite restore.
+2. `security/ParentalControlManager.kt` — Enforces `isAdultPattern(cat)` inside `isCategoryRestricted`.
+3. `ui/epg/EpgProgramDetailsBottomSheet.kt` — Enforces `ParentalGatekeeper` + PIN challenge before tuning live or catch-up playback, and validates catch-up availability before launching the player.
+4. `favorites/ui/FavoritesFragment.kt` — Enforces `ParentalGatekeeper` + PIN challenge before opening or playing favorites.
+5. `history/ui/UnifiedHistoryFragment.kt` — Enforces `ParentalGatekeeper` + PIN challenge before resuming or restarting history items.
+
+```python
+#!/usr/bin/env python3
+from pathlib import Path
+
+BASE_DIR = Path("/home/username/AndroidStudioProjects/Ytvmate/app/src/main/java/vid/mat/app")
+
+FILES = {
+    "backup/EncryptedBackupManager.kt": """package vid.mat.app.backup
+
+import android.util.Base64
+import androidx.room.withTransaction
+import com.google.gson.Gson
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.withContext
+import vid.mat.app.backup.model.BackupExportSummary
+import vid.mat.app.backup.model.BackupHeader
+import vid.mat.app.backup.model.BackupPayload
+import vid.mat.app.backup.model.BackupRestoreSummary
+import vid.mat.app.backup.model.ChannelBackupDto
+import vid.mat.app.backup.model.ChannelOverrideBackupDto
+import vid.mat.app.backup.model.CustomGroupBackupDto
+import vid.mat.app.backup.model.FavoriteBackupDto
+import vid.mat.app.backup.model.PlaylistSourceBackupDto
+import vid.mat.app.backup.model.ProfileBackupDto
+import vid.mat.app.backup.model.StreamEndpointBackupDto
+import vid.mat.app.backup.model.WatchHistoryBackupDto
+import vid.mat.app.backup.model.XtreamAccountBackupDto
+import vid.mat.app.data.dao.ChannelDao
+import vid.mat.app.data.dao.ChannelUserOverrideDao
+import vid.mat.app.data.dao.CustomGroupDao
+import vid.mat.app.data.dao.PlaylistSourceDao
+import vid.mat.app.data.dao.StreamEndpointDao
+import vid.mat.app.data.dao.WatchProgressDao
+import vid.mat.app.data.dao.XtreamAccountDao
+import vid.mat.app.data.database.VideoUrlDatabase
+import vid.mat.app.data.model.Channel
+import vid.mat.app.data.model.ChannelUserOverrideEntity
+import vid.mat.app.data.model.CustomGroupEntity
+import vid.mat.app.data.model.MediaContentType
+import vid.mat.app.data.model.PlaylistSource
+import vid.mat.app.data.model.SourceType
+import vid.mat.app.data.model.StreamEndpoint
+import vid.mat.app.data.model.WatchProgressEntity
+import vid.mat.app.data.model.XtreamAccount
+import vid.mat.app.data.sync.PlaylistFingerprint
+import vid.mat.app.favorites.ProfileFavoriteSynchronizer
+import vid.mat.app.favorites.dao.UnifiedFavoriteDao
+import vid.mat.app.favorites.model.FavoriteType
+import vid.mat.app.favorites.model.UnifiedFavoriteEntity
+import vid.mat.app.profile.ActiveProfileProvider
+import vid.mat.app.profile.dao.ProfileDao
+import vid.mat.app.profile.model.ProfileEntity
+import vid.mat.app.provider.normalization.ChannelNameNormalizer
+import vid.mat.app.security.CryptoUtils
+import vid.mat.app.security.EncryptedField
+import vid.mat.app.util.AppLogger
+import java.io.ByteArrayOutputStream
+import java.io.InputStream
+import java.io.OutputStream
+import java.nio.ByteBuffer
+import java.nio.charset.StandardCharsets
+import java.security.SecureRandom
+import javax.crypto.AEADBadTagException
+import javax.crypto.Cipher
+import javax.crypto.SecretKeyFactory
+import javax.crypto.spec.GCMParameterSpec
+import javax.crypto.spec.PBEKeySpec
+import javax.crypto.spec.SecretKeySpec
+import javax.inject.Inject
+import javax.inject.Singleton
+
+@Singleton
+class EncryptedBackupManager @Inject constructor(
+    private val database: VideoUrlDatabase,
+    private val sourceDao: PlaylistSourceDao,
+    private val channelDao: ChannelDao,
+    private val endpointDao: StreamEndpointDao,
+    private val overrideDao: ChannelUserOverrideDao,
+    private val groupDao: CustomGroupDao,
+    private val historyDao: WatchProgressDao,
+    private val profileDao: ProfileDao,
+    private val favoriteDao: UnifiedFavoriteDao,
+    private val xtreamDao: XtreamAccountDao,
+    private val activeProfileProvider: ActiveProfileProvider,
+    private val favoriteSynchronizer: ProfileFavoriteSynchronizer
+) {
+    companion object {
+        private const val TAG = "EncryptedBackupManager"
+        private const val MAGIC_HEADER = "IPTV_BACKUP_V2"
+        private const val LEGACY_MAGIC_HEADER = "IPTV_BACKUP_V1"
+        private const val MAX_HEADER_BYTES = 65_536
+        private const val MAX_BACKUP_BYTES = 256L * 1024L * 1024L
+        private const val PBKDF2_ITERATIONS = 65_536
+        private const val KEY_LENGTH_BITS = 256
+        private const val GCM_TAG_LENGTH = 128
+        private const val GCM_IV_LENGTH_BYTES = 12
+        private const val SALT_LENGTH_BYTES = 16
+    }
+
+    private val gson = Gson()
+
+    suspend fun exportBackup(outputStream: OutputStream, passphrase: String?): Result<BackupExportSummary> = withContext(Dispatchers.IO) {
+        try {
+            require(!passphrase.isNullOrBlank()) { "A non-empty backup passphrase is required for encrypted exports" }
+            val accounts = xtreamDao.getAll()
+            val accountById = accounts.associateBy { it.accountId }
+            val allSources = sourceDao.getAll()
+            val sources = allSources.map { source ->
+                val account = source.xtreamAccountId?.let { accountById[it] }
+                PlaylistSourceBackupDto(
+                    source.name, source.type.name, source.sourceUrl, source.epgUrl,
+                    account?.let { "${it.serverUrl}\u0000${it.username}" }
+                )
+            }
+            val sourceById = allSources.associateBy { it.sourceId }
+            val channels = channelDao.getAll().map { c ->
+                val source = sourceById[c.sourceId]
+                    ?: throw IllegalStateException("Channel ${c.channelIdentity} references missing source ${c.sourceId}")
+                val endpoints = endpointDao.getEndpointsForChannel(c.channelId).map { ep ->
+                    StreamEndpointBackupDto(
+                        url = ep.url,
+                        priority = ep.priority,
+                        containerFormat = ep.containerFormat,
+                        resolutionLabel = ep.resolutionLabel,
+                        userAgent = ep.userAgent,
+                        referer = ep.referer?.value,
+                        cookie = ep.cookie?.value,
+                        authorization = ep.authorization?.value
+                    )
+                }
+                ChannelBackupDto(
+                    channelIdentity = c.channelIdentity,
+                    sourceId = c.sourceId,
+                    sourceUrl = source.sourceUrl,
+                    sourceType = source.type.name,
+                    externalId = c.externalId,
+                    channelNumber = c.channelNumber,
+                    title = c.title,
+                    logoUrl = c.logoUrl,
+                    groupTitle = c.groupTitle,
+                    tvgId = c.tvgId,
+                    tvgName = c.tvgName,
+                    isFavorite = c.isFavorite,
+                    userOrder = c.userOrder,
+                    catchupDays = c.catchupDays,
+                    catchupSource = c.catchupSource,
+                    lastPlayedAtMs = c.lastPlayedAtMs,
+                    createdAtMs = c.createdAtMs,
+                    updatedAtMs = c.updatedAtMs,
+                    endpoints = endpoints
+                )
+            }
+            val overrides = overrideDao.getAll().map {
+                ChannelOverrideBackupDto(
+                    it.channelIdentity,
+                    it.customTitle,
+                    it.customGroupTitle,
+                    it.customLogoUrl,
+                    it.customChannelNumber,
+                    it.userOrderIndex,
+                    it.isHidden,
+                    it.isFavorite
+                )
+            }
+            val customGroups = runCatching { groupDao.getAllFlow().first() }.getOrDefault(emptyList())
+                .map { CustomGroupBackupDto(it.name, it.sortOrder, it.isHidden, it.isUserCreated) }
+            val profileEntities = profileDao.getAllProfiles()
+            val profiles = profileEntities.map { profile ->
+                if (profile.isProtected && !isValidProfileVerifier(profile.pinHash)) {
+                    throw IllegalStateException("Protected profile ${profile.id} cannot be backed up because its PIN verifier is invalid")
+                }
+                ProfileBackupDto(profile.id, profile.name, profile.avatarColorHex, profile.avatarIconName, profile.isKidsProfile, profile.isProtected, profile.pinHash, profile.isDefault)
+            }
+            val history = buildList {
+                for (profile in profileEntities) {
+                    historyDao.getRecentHistory(profile.id, 500).first().forEach { progress ->
+                        add(WatchHistoryBackupDto(progress.mediaKey, progress.mediaTitle, progress.streamUrl, progress.positionMs, progress.durationMs, progress.completionPercent, progress.profileId, progress.contentType.name, progress.mediaSubtitle, progress.thumbnailUrl, progress.seriesId, progress.seasonNumber, progress.episodeNumber, progress.lastWatchedTimestampMs, progress.isCompleted))
+                    }
+                }
+            }
+            val favorites = buildList {
+                for (profile in profileEntities) {
+                    favoriteDao.getFavoritesFlow(profile.id, null, null, "").first().forEach { favorite ->
+                        add(
+                            FavoriteBackupDto(
+                                targetId = favorite.targetId, profileId = favorite.profileId, type = favorite.type.name,
+                                title = favorite.title, subtitle = favorite.subtitle, groupTitle = favorite.groupTitle,
+                                logoUrl = favorite.logoUrl, streamUrl = favorite.streamUrl,
+                                customFavoriteGroup = favorite.customFavoriteGroup, userOrder = favorite.userOrder,
+                                createdAtMs = favorite.createdAtMs
+                            )
+                        )
+                    }
+                }
+            }
+
+            val xtreamAccounts = accounts.map { xa ->
+                val password = when (val decrypted = CryptoUtils.decrypt(xa.encryptedPassword, xa.iv)) {
+                    is CryptoUtils.DecryptionResult.Success -> decrypted.plaintext
+                    CryptoUtils.DecryptionResult.KeyInvalidated -> throw IllegalStateException("Xtream credentials key is invalidated; re-authentication is required before backup")
+                    CryptoUtils.DecryptionResult.Corrupted -> throw IllegalStateException("Xtream credentials are corrupted and cannot be backed up")
+                    is CryptoUtils.DecryptionResult.Failure -> throw IllegalStateException("Xtream credentials could not be decrypted for backup", decrypted.cause)
+                }
+                XtreamAccountBackupDto(xa.serverUrl, xa.username, "", "", password)
+            }
+
+            val payloadBytes = gson.toJson(BackupPayload(sources, channels, overrides, customGroups, profiles, history, favorites, xtreamAccounts))
+                .toByteArray(StandardCharsets.UTF_8)
+            val salt = ByteArray(SALT_LENGTH_BYTES).also { SecureRandom().nextBytes(it) }
+            val iv = ByteArray(GCM_IV_LENGTH_BYTES).also { SecureRandom().nextBytes(it) }
+            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+            cipher.init(Cipher.ENCRYPT_MODE, deriveKey(passphrase, salt), GCMParameterSpec(GCM_TAG_LENGTH, iv))
+            val ciphertext = cipher.doFinal(payloadBytes)
+            val headerBytes = gson.toJson(
+                BackupHeader(
+                    MAGIC_HEADER, 2, System.currentTimeMillis(), "1.0.0", true,
+                    Base64.encodeToString(salt, Base64.NO_WRAP), Base64.encodeToString(iv, Base64.NO_WRAP)
+                )
+            ).toByteArray(StandardCharsets.UTF_8)
+
+            require(headerBytes.size <= MAX_HEADER_BYTES)
+            outputStream.use { os ->
+                os.write(ByteBuffer.allocate(4).putInt(headerBytes.size).array())
+                os.write(headerBytes)
+                os.write(ciphertext)
+                os.flush()
+            }
+            Result.success(BackupExportSummary(sources.size, channels.size, overrides.size, history.size, profiles.size, 4L + headerBytes.size + ciphertext.size))
+        } catch (e: Exception) {
+            AppLogger.e(TAG, "Export failed", e)
+            Result.failure(e)
+        }
+    }
+
+    suspend fun importBackup(inputStream: InputStream, passphrase: String?): Result<BackupRestoreSummary> = withContext(Dispatchers.IO) {
+        try {
+            val (header, ciphertext) = inputStream.use { stream ->
+                val lengthBytes = readExactly(stream, 4) ?: throw IllegalStateException("Invalid backup file structure")
+                val headerLength = ByteBuffer.wrap(lengthBytes).int
+                require(headerLength in 1..MAX_HEADER_BYTES) { "Invalid backup header length" }
+                val headerBytes = readExactly(stream, headerLength) ?: throw IllegalStateException("Malformed backup header")
+                val parsed = gson.fromJson(String(headerBytes, StandardCharsets.UTF_8), BackupHeader::class.java)
+                require(parsed.magic == MAGIC_HEADER || parsed.magic == LEGACY_MAGIC_HEADER) { "Unsupported backup format" }
+                val remaining = stream.readBytesLimited(MAX_BACKUP_BYTES - 4L - headerLength)
+                Pair(parsed, remaining)
+            }
+            val salt = Base64.decode(header.saltBase64, Base64.NO_WRAP)
+            val iv = Base64.decode(header.ivBase64, Base64.NO_WRAP)
+            require(salt.size == SALT_LENGTH_BYTES && iv.size == GCM_IV_LENGTH_BYTES) { "Invalid backup cryptographic parameters" }
+            val effectivePassphrase = passphrase ?: if (header.magic == LEGACY_MAGIC_HEADER) "DEFAULT_IPTV_KEY" else throw IllegalArgumentException("Backup passphrase is required")
+            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+            cipher.init(Cipher.DECRYPT_MODE, deriveKey(effectivePassphrase, salt), GCMParameterSpec(GCM_TAG_LENGTH, iv))
+            val payload = gson.fromJson(String(cipher.doFinal(ciphertext), StandardCharsets.UTF_8), BackupPayload::class.java)
+                ?: throw IllegalArgumentException("Backup payload is empty")
+
+            var restoredSources = 0
+            var restoredChannels = 0
+            var restoredOverrides = 0
+            var restoredProfiles = 0
+            var restoredHistory = 0
+            var restoredFavorites = 0
+            var restoredDefaultProfileId: Long? = null
+
+            database.withTransaction {
+                val restoredProfileIds = HashMap<Long, Long>()
+                val accountIds = HashMap<String, Long>()
+                val identityRemap = HashMap<String, String>()
+
+                payload.xtreamAccounts.forEach { xa ->
+                    val passwordResult = xa.password?.let { CryptoUtils.encrypt(it) }
+                    val encrypted = when (passwordResult) {
+                        is CryptoUtils.EncryptionResult.Success -> passwordResult.result
+                        CryptoUtils.EncryptionResult.KeyInvalidated -> throw IllegalStateException("Device credential key is invalidated; re-authentication is required")
+                        is CryptoUtils.EncryptionResult.Failure -> throw IllegalStateException("Unable to securely restore Xtream credentials", passwordResult.cause)
+                        null -> null
+                    }
+                    val existing = xtreamDao.getByServerAndUsername(xa.serverUrl, xa.username)
+                    val id = if (existing != null && encrypted == null) existing.accountId else xtreamDao.insert(
+                        XtreamAccount(
+                            accountId = existing?.accountId ?: 0L,
+                            serverUrl = xa.serverUrl,
+                            username = xa.username,
+                            encryptedPassword = encrypted?.ciphertextBase64 ?: xa.encryptedPassBase64,
+                            iv = encrypted?.ivBase64 ?: xa.ivBase64
+                        )
+                    )
+                    accountIds["${xa.serverUrl}\u0000${xa.username}"] = id
+                }
+
+                val sourceIds = HashMap<String, Long>()
+                payload.sources.forEach { src ->
+                    val type = runCatching { SourceType.valueOf(src.type) }.getOrDefault(SourceType.M3U_REMOTE)
+                    val existing = sourceDao.getByUrlAndType(src.sourceUrl, type)
+                    val accountId = src.xtreamAccountKey?.let { accountIds[it] }
+                    val id = existing?.sourceId ?: sourceDao.insert(
+                        PlaylistSource(name = src.name, type = type, sourceUrl = src.sourceUrl, epgUrl = src.epgUrl, xtreamAccountId = accountId)
+                    )
+                    sourceIds["${type.name}\u0000${src.sourceUrl}"] = id
+                    restoredSources++
+                }
+
+                payload.channels.forEach { c ->
+                    if (c.sourceUrl.isBlank()) return@forEach
+                    val type = runCatching { SourceType.valueOf(c.sourceType) }.getOrDefault(SourceType.M3U_REMOTE)
+                    val sourceId = sourceIds["${type.name}\u0000${c.sourceUrl}"]
+                        ?: sourceDao.getByUrlAndType(c.sourceUrl, type)?.sourceId
+                        ?: return@forEach
+
+                    val targetIdentity = if (c.sourceId > 0L && c.sourceId != sourceId) {
+                        val canonicalTitle = ChannelNameNormalizer.normalize(c.title).ifBlank { c.title }
+                        PlaylistFingerprint.computeIdentity(sourceId, c.externalId, c.tvgId, canonicalTitle)
+                    } else {
+                        c.channelIdentity
+                    }
+                    identityRemap[c.channelIdentity] = targetIdentity
+
+                    val existingChannel = channelDao.getByIdentity(targetIdentity)
+                    val channelId = if (existingChannel != null) {
+                        existingChannel.channelId
+                    } else {
+                        val inserted = channelDao.insert(
+                            Channel(
+                                sourceId = sourceId,
+                                channelIdentity = targetIdentity,
+                                externalId = c.externalId,
+                                channelNumber = c.channelNumber,
+                                title = c.title,
+                                logoUrl = c.logoUrl,
+                                groupTitle = c.groupTitle,
+                                tvgId = c.tvgId,
+                                tvgName = c.tvgName,
+                                isFavorite = c.isFavorite,
+                                userOrder = c.userOrder,
+                                catchupDays = c.catchupDays,
+                                catchupSource = c.catchupSource,
+                                lastPlayedAtMs = c.lastPlayedAtMs,
+                                createdAtMs = c.createdAtMs.takeIf { it > 0 } ?: System.currentTimeMillis(),
+                                updatedAtMs = c.updatedAtMs.takeIf { it > 0 } ?: System.currentTimeMillis()
+                            )
+                        )
+                        if (inserted != -1L) {
+                            restoredChannels++
+                            inserted
+                        } else {
+                            channelDao.getByIdentity(targetIdentity)?.channelId ?: -1L
+                        }
+                    }
+
+                    if (channelId > 0L && c.endpoints.isNotEmpty()) {
+                        val existingUrls = endpointDao.getEndpointsForChannel(channelId).map { it.url }.toSet()
+                        val toInsert = c.endpoints.filterNot { it.url in existingUrls }.map { ep ->
+                            StreamEndpoint(
+                                channelId = channelId,
+                                url = ep.url,
+                                priority = ep.priority,
+                                containerFormat = ep.containerFormat,
+                                resolutionLabel = ep.resolutionLabel,
+                                userAgent = ep.userAgent,
+                                referer = EncryptedField.from(ep.referer),
+                                cookie = EncryptedField.from(ep.cookie),
+                                authorization = EncryptedField.from(ep.authorization)
+                            )
+                        }
+                        if (toInsert.isNotEmpty()) endpointDao.insertBatch(toInsert)
+                    }
+                }
+
+                payload.overrides.forEach { o ->
+                    val mappedIdentity = identityRemap[o.channelIdentity] ?: o.channelIdentity
+                    overrideDao.upsert(
+                        ChannelUserOverrideEntity(
+                            channelIdentity = mappedIdentity,
+                            customTitle = o.customTitle,
+                            customGroupTitle = o.customGroupTitle,
+                            customLogoUrl = o.customLogoUrl,
+                            customChannelNumber = o.customChannelNumber,
+                            userOrderIndex = o.userOrderIndex,
+                            isHidden = o.isHidden,
+                            isFavorite = o.isFavorite
+                        )
+                    )
+                    restoredOverrides++
+                }
+                payload.customGroups.forEach { g ->
+                    groupDao.insert(
+                        CustomGroupEntity(
+                            name = g.name,
+                            sortOrder = g.sortOrder,
+                            isHidden = g.isHidden,
+                            isUserCreated = g.isUserCreated
+                        )
+                    )
+                }
+
+                val existingProfilesByName = profileDao.getAllProfiles().associateBy { it.name.trim().lowercase() }
+                if (payload.profiles.any { it.isDefault }) {
+                    profileDao.clearDefaultFlags()
+                }
+                payload.profiles.forEach { p ->
+                    if (p.isProtected && !isValidProfileVerifier(p.pinHash)) {
+                        throw IllegalArgumentException("Backup contains an invalid verifier for protected profile '${p.name}'")
+                    }
+                    val existing = existingProfilesByName[p.name.trim().lowercase()]
+                    val restoredId = if (existing != null) {
+                        profileDao.update(
+                            existing.copy(
+                                avatarColorHex = p.avatarColorHex,
+                                avatarIconName = p.avatarIconName,
+                                isKidsProfile = p.isKidsProfile,
+                                isProtected = p.isProtected,
+                                pinHash = p.pinHash,
+                                isDefault = p.isDefault
+                            )
+                        )
+                        existing.id
+                    } else {
+                        profileDao.insert(
+                            ProfileEntity(
+                                name = p.name,
+                                avatarColorHex = p.avatarColorHex,
+                                avatarIconName = p.avatarIconName,
+                                isKidsProfile = p.isKidsProfile,
+                                isProtected = p.isProtected,
+                                pinHash = p.pinHash,
+                                isDefault = p.isDefault
+                            )
+                        )
+                    }
+                    if (restoredId > 0L) {
+                        restoredProfileIds[p.sourceProfileId] = restoredId
+                        if (p.sourceProfileId <= 0L) restoredProfileIds.putIfAbsent(1L, restoredId)
+                        if (p.isDefault || restoredDefaultProfileId == null) {
+                            restoredDefaultProfileId = restoredId
+                        }
+                    }
+                    restoredProfiles++
+                }
+                payload.favorites.forEach { f ->
+                    val restoredProfileId = restoredProfileIds[f.profileId] ?: return@forEach
+                    val type = runCatching { FavoriteType.valueOf(f.type) }.getOrNull() ?: return@forEach
+                    if ((type == FavoriteType.VOD_MOVIE || type == FavoriteType.SERIES) &&
+                        (f.targetId.startsWith("movie_") || f.targetId.startsWith("series_"))
+                    ) {
+                        return@forEach
+                    }
+                    val remappedTarget = if (f.targetId.startsWith("live_identity:")) {
+                        val oldId = f.targetId.removePrefix("live_identity:")
+                        "live_identity:${identityRemap[oldId] ?: oldId}"
+                    } else {
+                        f.targetId
+                    }
+                    favoriteDao.upsert(
+                        UnifiedFavoriteEntity(
+                            targetId = remappedTarget,
+                            profileId = restoredProfileId,
+                            type = type,
+                            title = f.title,
+                            subtitle = f.subtitle,
+                            groupTitle = f.groupTitle,
+                            logoUrl = f.logoUrl,
+                            streamUrl = f.streamUrl,
+                            customFavoriteGroup = f.customFavoriteGroup,
+                            userOrder = f.userOrder,
+                            createdAtMs = f.createdAtMs.takeIf { it > 0 } ?: System.currentTimeMillis()
+                        )
+                    )
+                    restoredFavorites++
+                }
+                payload.history.forEach { h ->
+                    val restoredProfileId = restoredProfileIds[h.profileId] ?: return@forEach
+                    val remappedKey = identityRemap[h.mediaKey] ?: h.mediaKey
+                    val remappedStreamUrl = identityRemap[h.streamUrl] ?: h.streamUrl
+                    historyDao.upsert(
+                        WatchProgressEntity(
+                            mediaKey = remappedKey,
+                            profileId = restoredProfileId,
+                            contentType = runCatching { MediaContentType.valueOf(h.contentType) }.getOrDefault(MediaContentType.LIVE_TV),
+                            mediaTitle = h.mediaTitle,
+                            mediaSubtitle = h.mediaSubtitle,
+                            thumbnailUrl = h.thumbnailUrl,
+                            streamUrl = remappedStreamUrl,
+                            positionMs = h.positionMs,
+                            durationMs = h.durationMs,
+                            completionPercent = h.completionPercent,
+                            isCompleted = h.isCompleted,
+                            seriesId = h.seriesId,
+                            seasonNumber = h.seasonNumber,
+                            episodeNumber = h.episodeNumber,
+                            lastWatchedTimestampMs = h.lastWatchedTimestampMs.takeIf { it > 0 } ?: System.currentTimeMillis()
+                        )
+                    )
+                    restoredHistory++
+                }
+            }
+
+            val profileToActivate = restoredDefaultProfileId ?: activeProfileProvider.awaitInitializedProfile().id
+            if (!activeProfileProvider.switchProfile(profileToActivate)) {
+                favoriteSynchronizer.syncProfile(activeProfileProvider.activeProfile.value.id)
+            }
+
+            Result.success(BackupRestoreSummary(restoredSources, restoredChannels, restoredOverrides, restoredProfiles, restoredHistory, restoredFavorites))
+        } catch (_: AEADBadTagException) {
+            Result.failure(IllegalArgumentException("Incorrect passphrase or corrupted backup file"))
+        } catch (e: Exception) {
+            AppLogger.e(TAG, "Import failed", e)
+            Result.failure(e)
+        }
+    }
+
+    private fun isValidProfileVerifier(verifier: String?): Boolean {
+        if (verifier.isNullOrBlank()) return false
+        if (verifier.startsWith("PBKDF2v1:")) {
+            val parts = verifier.split(':')
+            return parts.size == 3 && runCatching {
+                val salt = Base64.decode(parts[1], Base64.NO_WRAP)
+                val derived = Base64.decode(parts[2], Base64.NO_WRAP)
+                salt.size == 16 && derived.size == 32
+            }.getOrDefault(false)
+        }
+        return verifier.matches(Regex("^[0-9a-fA-F]{64}$"))
+    }
+
+    private fun readExactly(input: InputStream, length: Int): ByteArray? {
+        val result = ByteArray(length)
+        var offset = 0
+        while (offset < length) {
+            val read = input.read(result, offset, length - offset)
+            if (read < 0) return null
+            if (read == 0) continue
+            offset += read
+        }
+        return result
+    }
+
+    private fun InputStream.readBytesLimited(maxBytes: Long): ByteArray {
+        require(maxBytes >= 0)
+        val out = ByteArrayOutputStream()
+        val buffer = ByteArray(32 * 1024)
+        var total = 0L
+        while (true) {
+            val n = read(buffer)
+            if (n < 0) break
+            if (n == 0) continue
+            total += n
+            if (total > maxBytes) throw IllegalArgumentException("Backup file exceeds maximum supported size")
+            out.write(buffer, 0, n)
+        }
+        return out.toByteArray()
+    }
+
+    private fun deriveKey(passphrase: String, salt: ByteArray): SecretKeySpec {
+        val spec = PBEKeySpec(passphrase.toCharArray(), salt, PBKDF2_ITERATIONS, KEY_LENGTH_BITS)
+        return SecretKeySpec(SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256").generateSecret(spec).encoded, "AES")
+    }
+}
+""",
+
+    "security/ParentalControlManager.kt": """package vid.mat.app.security
+
+import android.content.Context
+import android.util.Base64
+import androidx.core.content.edit
+import androidx.security.crypto.EncryptedSharedPreferences
+import androidx.security.crypto.MasterKey
+import dagger.hilt.android.qualifiers.ApplicationContext
+import java.security.SecureRandom
+import javax.crypto.SecretKeyFactory
+import javax.crypto.spec.PBEKeySpec
+import javax.inject.Inject
+import javax.inject.Singleton
+
+@Singleton
+class ParentalControlManager @Inject constructor(
+    @ApplicationContext context: Context
+) {
+
+    companion object {
+        private const val PREFS_NAME = "parental_control_secure_prefs"
+        private const val KEY_PIN_HASH = "parental_pin_hash"
+        private const val KEY_ENABLED = "parental_protection_enabled"
+        private const val KEY_LOCKED_CATEGORIES = "locked_category_names"
+        private const val KEY_LOCKED_CHANNELS = "locked_channel_identities"
+        private const val KEY_CUSTOM_BLOCKED_WORDS = "custom_blocked_words"
+        private const val KEY_SESSION_TIMEOUT_MINUTES = "session_timeout_minutes"
+        private const val KEY_FAILED_ATTEMPTS = "failed_pin_attempts"
+        private const val KEY_LOCKOUT_TIMESTAMP = "lockout_until_timestamp"
+        private const val KEY_PIN_SALT = "parental_pin_salt"
+        private const val PBKDF2_ITERATIONS = 120_000
+        private const val PBKDF2_KEY_BITS = 256
+    }
+
+    private val masterKey = MasterKey.Builder(context)
+        .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
+        .build()
+
+    private val prefs = EncryptedSharedPreferences.create(
+        context,
+        PREFS_NAME,
+        masterKey,
+        EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
+        EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
+    )
+
+    private var sessionAuthenticatedTime = 0L
+
+    val isParentalControlActive: Boolean
+        get() = prefs.getBoolean(KEY_ENABLED, false)
+
+    var sessionTimeoutMinutes: Int
+        get() = prefs.getInt(KEY_SESSION_TIMEOUT_MINUTES, 15)
+        set(value) { prefs.edit { putInt(KEY_SESSION_TIMEOUT_MINUTES, value) } }
+
+    fun setParentalControlEnabled(enabled: Boolean) {
+        prefs.edit { putBoolean(KEY_ENABLED, enabled) }
+    }
+
+    fun setPin(pin: String) {
+        require(pin.length in 4..12) { "PIN must contain 4 to 12 characters" }
+        require(pin.all { it.isDigit() }) { "PIN must contain digits only" }
+        val salt = ByteArray(16).also { SecureRandom().nextBytes(it) }
+        val hash = hashPin(pin, salt)
+        prefs.edit {
+            putString(KEY_PIN_HASH, hash)
+            putString(KEY_PIN_SALT, Base64.encodeToString(salt, Base64.NO_WRAP))
+            putBoolean(KEY_ENABLED, true)
+            putInt(KEY_FAILED_ATTEMPTS, 0)
+            putLong(KEY_LOCKOUT_TIMESTAMP, 0L)
+        }
+    }
+
+    fun isLockedOut(): Boolean {
+        val lockoutUntil = prefs.getLong(KEY_LOCKOUT_TIMESTAMP, 0L)
+        return System.currentTimeMillis() < lockoutUntil
+    }
+
+    fun getRemainingLockoutSeconds(): Int {
+        val lockoutUntil = prefs.getLong(KEY_LOCKOUT_TIMESTAMP, 0L)
+        val remainingMs = lockoutUntil - System.currentTimeMillis()
+        return if (remainingMs > 0) (remainingMs / 1000).toInt() else 0
+    }
+
+    fun verifyPin(pin: String): Boolean {
+        if (isLockedOut()) return false
+        val storedHash = prefs.getString(KEY_PIN_HASH, null) ?: return false
+        val saltB64 = prefs.getString(KEY_PIN_SALT, null)
+        val matches = if (!saltB64.isNullOrBlank()) {
+            val salt = runCatching { Base64.decode(saltB64, Base64.NO_WRAP) }.getOrNull()
+            salt != null && java.security.MessageDigest.isEqual(
+                Base64.decode(storedHash, Base64.NO_WRAP),
+                Base64.decode(hashPin(pin, salt), Base64.NO_WRAP)
+            )
+        } else {
+            val legacy = java.security.MessageDigest.getInstance("SHA-256")
+                .digest(pin.toByteArray(Charsets.UTF_8))
+                .joinToString("") { "%02x".format(it) }
+            if (storedHash == legacy) {
+                setPin(pin)
+                true
+            } else false
+        }
+        if (matches) {
+            sessionAuthenticatedTime = System.currentTimeMillis()
+            prefs.edit {
+                putInt(KEY_FAILED_ATTEMPTS, 0)
+                putLong(KEY_LOCKOUT_TIMESTAMP, 0L)
+            }
+        } else {
+            val failedCount = prefs.getInt(KEY_FAILED_ATTEMPTS, 0) + 1
+            val lockoutDelayMs = when {
+                failedCount >= 5 -> 300_000L
+                failedCount >= 3 -> 30_000L
+                else -> 0L
+            }
+            prefs.edit {
+                putInt(KEY_FAILED_ATTEMPTS, failedCount)
+                if (lockoutDelayMs > 0) {
+                    putLong(KEY_LOCKOUT_TIMESTAMP, System.currentTimeMillis() + lockoutDelayMs)
+                }
+            }
+        }
+        return matches
+    }
+
+    fun isSessionUnlocked(): Boolean {
+        if (!isParentalControlActive) return true
+        val timeoutMs = sessionTimeoutMinutes * 60_000L
+        return (System.currentTimeMillis() - sessionAuthenticatedTime) < timeoutMs
+    }
+
+    fun lockSessionNow() {
+        sessionAuthenticatedTime = 0L
+    }
+
+    fun lockCategory(categoryName: String) {
+        val locked = getLockedCategories().toMutableSet()
+        locked.add(categoryName.trim().lowercase())
+        prefs.edit { putStringSet(KEY_LOCKED_CATEGORIES, locked) }
+    }
+
+    fun unlockCategory(categoryName: String) {
+        val locked = getLockedCategories().toMutableSet()
+        locked.remove(categoryName.trim().lowercase())
+        prefs.edit { putStringSet(KEY_LOCKED_CATEGORIES, locked) }
+    }
+
+    fun lockChannel(channelIdentity: String) {
+        val locked = getLockedChannels().toMutableSet()
+        locked.add(channelIdentity)
+        prefs.edit { putStringSet(KEY_LOCKED_CHANNELS, locked) }
+    }
+
+    fun unlockChannel(channelIdentity: String) {
+        val locked = getLockedChannels().toMutableSet()
+        locked.remove(channelIdentity)
+        prefs.edit { putStringSet(KEY_LOCKED_CHANNELS, locked) }
+    }
+
+    fun isChannelLocked(channelIdentity: String): Boolean {
+        return getLockedChannels().contains(channelIdentity)
+    }
+
+    fun getCustomBlockedKeywords(): Set<String> =
+        prefs.getStringSet(KEY_CUSTOM_BLOCKED_WORDS, emptySet()) ?: emptySet()
+
+    fun addBlockedKeyword(keyword: String) {
+        val blocked = getCustomBlockedKeywords().toMutableSet()
+        blocked.add(keyword.trim().lowercase())
+        prefs.edit { putStringSet(KEY_CUSTOM_BLOCKED_WORDS, blocked) }
+    }
+
+    fun removeBlockedKeyword(keyword: String) {
+        val blocked = getCustomBlockedKeywords().toMutableSet()
+        blocked.remove(keyword.trim().lowercase())
+        prefs.edit { putStringSet(KEY_CUSTOM_BLOCKED_WORDS, blocked) }
+    }
+
+    fun isCategoryRestricted(categoryName: String): Boolean {
+        val cat = categoryName.trim().lowercase()
+        if (cat.isBlank()) return false
+        val locked = getLockedCategories()
+        if (locked.contains(cat)) return true
+
+        val customBlocked = getCustomBlockedKeywords()
+        if (customBlocked.any { cat.contains(it) }) return true
+
+        return isAdultPattern(cat)
+    }
+
+    fun getLockedCategories(): Set<String> =
+        prefs.getStringSet(KEY_LOCKED_CATEGORIES, emptySet()) ?: emptySet()
+
+    fun getLockedChannels(): Set<String> =
+        prefs.getStringSet(KEY_LOCKED_CHANNELS, emptySet()) ?: emptySet()
+
+    private fun isAdultPattern(name: String): Boolean {
+        val adultKeywords = listOf("adult", "xxx", "porn", "18+", "erotic", "nsfw", "for adults")
+        return adultKeywords.any { name.contains(it) }
+    }
+
+    private fun hashPin(pin: String, salt: ByteArray): String {
+        val spec = PBEKeySpec(pin.toCharArray(), salt, PBKDF2_ITERATIONS, PBKDF2_KEY_BITS)
+        return try {
+            val factory = SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256")
+            Base64.encodeToString(factory.generateSecret(spec).encoded, Base64.NO_WRAP)
+        } finally {
+            spec.clearPassword()
+        }
+    }
+}
+""",
+
+    "ui/epg/EpgProgramDetailsBottomSheet.kt": """package vid.mat.app.ui.epg
+
+import android.content.Intent
+import android.os.Bundle
+import android.view.LayoutInflater
+import android.view.View
+import android.view.ViewGroup
+import android.widget.Toast
+import androidx.lifecycle.lifecycleScope
+import com.google.android.material.bottomsheet.BottomSheetDialogFragment
+import dagger.hilt.android.AndroidEntryPoint
+import kotlinx.coroutines.launch
+import vid.mat.app.R
+import vid.mat.app.catchup.UnifiedCatchupEngine
+import vid.mat.app.data.model.Channel
+import vid.mat.app.databinding.BottomSheetEpgProgramDetailsBinding
+import vid.mat.app.dvr.ui.ScheduleRecordingDialogFragment
+import vid.mat.app.epg.model.EpgProgram
+import vid.mat.app.epg.reminder.EpgReminderScheduler
+import vid.mat.app.image.LogoImageLoader
+import vid.mat.app.security.ParentalGatekeeper
+import vid.mat.app.ui.MediaPlayerActivity
+import vid.mat.app.ui.security.ParentalPinChallengeDialog
+import vid.mat.app.util.Utils.Companion.formatTime
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import javax.inject.Inject
+
+@AndroidEntryPoint
+class EpgProgramDetailsBottomSheet : BottomSheetDialogFragment() {
+
+    private var _binding: BottomSheetEpgProgramDetailsBinding? = null
+    private val binding get() = _binding!!
+
+    @Inject
+    lateinit var unifiedCatchupEngine: UnifiedCatchupEngine
+
+    @Inject
+    lateinit var parentalGatekeeper: ParentalGatekeeper
+
+    private var channel: Channel? = null
+    private var program: EpgProgram? = null
+    private var pendingParentalAction: (() -> Unit)? = null
+
+    private val timeFormat = SimpleDateFormat("EEEE, d MMM    HH:mm", Locale.getDefault())
+    private val endTimeFormat = SimpleDateFormat("HH:mm", Locale.getDefault())
+
+    override fun onCreateView(
+        inflater: LayoutInflater,
+        container: ViewGroup?,
+        savedInstanceState: Bundle?
+    ): View {
+        _binding = BottomSheetEpgProgramDetailsBinding.inflate(inflater, container, false)
+        return binding.root
+    }
+
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        super.onViewCreated(view, savedInstanceState)
+
+        childFragmentManager.setFragmentResultListener(
+            ParentalPinChallengeDialog.RESULT_KEY,
+            viewLifecycleOwner
+        ) { _, bundle ->
+            if (bundle.getBoolean(ParentalPinChallengeDialog.KEY_UNLOCKED, false)) {
+                childFragmentManager.clearFragmentResult(ParentalPinChallengeDialog.RESULT_KEY)
+                val action = pendingParentalAction
+                pendingParentalAction = null
+                action?.invoke()
+            }
+        }
+
+        val ch = readChannelArgument() ?: return
+        val prog = readProgramArgument() ?: return
+
+        val nowMs = System.currentTimeMillis()
+        val isAiringNow = prog.startMs <= nowMs && prog.stopMs > nowMs
+        val isPast = prog.stopMs <= nowMs
+
+        val catchupWindowMs = ch.catchupDays.toLong() * 86_400_000L
+        val catchupAvailable = isPast &&
+            ch.catchupDays > 0 &&
+            (nowMs - prog.stopMs) < catchupWindowMs
+
+        binding.tvProgramTitle.text = prog.title
+        binding.tvChannelName.text = ch.title
+        binding.tvCategory.text = prog.category ?: "General"
+        binding.tvTimeSlot.text = "${timeFormat.format(Date(prog.startMs))} - ${endTimeFormat.format(Date(prog.stopMs))}"
+
+        val durationMs = prog.stopMs - prog.startMs
+        binding.tvDuration.text = formatTime(durationMs)
+        binding.tvDescription.text =
+            prog.description ?: "No detailed synopsis available for this broadcast."
+
+        LogoImageLoader.load(requireContext(), ch.title, ch.logoUrl, binding.ivChannelLogo, 8f)
+
+        when {
+            isAiringNow -> {
+                binding.btnPrimaryAction.text = "Watch Live Now"
+                binding.btnPrimaryAction.setIconResource(R.drawable.ic_play)
+                binding.btnPrimaryAction.setOnClickListener { tuneChannel(ch) }
+
+                binding.btnSecondaryAction.visibility = View.VISIBLE
+                binding.btnSecondaryAction.text = "Record"
+                binding.btnSecondaryAction.setOnClickListener { openDvrDialog(ch, prog) }
+            }
+
+            catchupAvailable -> {
+                binding.btnPrimaryAction.text = "Play Catch-Up"
+                binding.btnPrimaryAction.setIconResource(R.drawable.ic_replay)
+                binding.btnPrimaryAction.setOnClickListener { playCatchup(ch, prog) }
+                binding.btnSecondaryAction.visibility = View.GONE
+            }
+
+            isPast && !catchupAvailable -> {
+                binding.btnPrimaryAction.text = "Watch Live Channel"
+                binding.btnPrimaryAction.setIconResource(R.drawable.ic_play)
+                binding.btnPrimaryAction.setOnClickListener { tuneChannel(ch) }
+
+                binding.btnSecondaryAction.visibility = View.GONE
+            }
+
+            else -> {
+                binding.btnPrimaryAction.text = "Set Reminder"
+                binding.btnPrimaryAction.setIconResource(R.drawable.ic_notification)
+                binding.btnPrimaryAction.setOnClickListener {
+                    EpgReminderScheduler.scheduleReminder(
+                        requireContext(), prog, ch.title, ch.channelIdentity
+                    )
+                    Toast.makeText(
+                        requireContext(),
+                        "Reminder set for '${prog.title}'",
+                        Toast.LENGTH_SHORT
+                    ).show()
+                    dismiss()
+                }
+
+                binding.btnSecondaryAction.visibility = View.VISIBLE
+                binding.btnSecondaryAction.text = "Schedule DVR"
+                binding.btnSecondaryAction.setOnClickListener { openDvrDialog(ch, prog) }
+            }
+        }
+    }
+
+    private fun tuneChannel(ch: Channel) {
+        if (parentalGatekeeper.isChannelRestricted(ch)) {
+            pendingParentalAction = { executeTuneChannel(ch) }
+            ParentalPinChallengeDialog.newInstance(
+                title = "Restricted Channel",
+                message = "'${ch.title}' is locked by parental controls."
+            ).show(childFragmentManager, ParentalPinChallengeDialog.TAG)
+            return
+        }
+        executeTuneChannel(ch)
+    }
+
+    private fun executeTuneChannel(ch: Channel) {
         val intent = Intent(requireContext(), MediaPlayerActivity::class.java).apply {
-            putExtra(MediaPlayerActivity.EXTRA_MEDIA_PATH, catchupId)
-            putExtra(MediaPlayerActivity.EXTRA_MEDIA_TITLE, "${ch.title}: ${prog.title}")
+            putExtra(MediaPlayerActivity.EXTRA_MEDIA_PATH, ch.channelIdentity)
+            putExtra(MediaPlayerActivity.EXTRA_MEDIA_TITLE, ch.title)
             putExtra(MediaPlayerActivity.EXTRA_MEDIA_THUMBNAIL, ch.logoUrl)
             putExtra("group_title", ch.groupTitle)
-            putExtra(MediaPlayerActivity.EXTRA_RESUME_POSITION, 0L)
         }
         startActivity(intent)
         dismiss()
     }
-}
-```
 
-#### `favorites/ui/FavoritesFragment.kt`, `history/ui/UnifiedHistoryFragment.kt`, `home/ui/HomeDashboardFragment.kt` — Enforce `ParentalGatekeeper` before starting playback (guards against session timeout or Kids profile)
-```kotlin
-// Pattern applied in FavoritesFragment.launchPlayer(...), UnifiedHistoryFragment.resumePlayback/restartPlayback(...),
-// and HomeDashboardFragment.handleCardClick(...):
-@Inject
-lateinit var parentalGatekeeper: vid.mat.app.security.ParentalGatekeeper
-
-private var pendingParentalAction: (() -> Unit)? = null
-
-// Register listener in onViewCreated:
-parentFragmentManager.setFragmentResultListener(
-    vid.mat.app.ui.security.ParentalPinChallengeDialog.RESULT_KEY,
-    viewLifecycleOwner
-) { _, bundle ->
-    if (bundle.getBoolean(vid.mat.app.ui.security.ParentalPinChallengeDialog.KEY_UNLOCKED, false)) {
-        parentFragmentManager.clearFragmentResult(vid.mat.app.ui.security.ParentalPinChallengeDialog.RESULT_KEY)
-        val action = pendingParentalAction
-        pendingParentalAction = null
-        action?.invoke()
+    private fun playCatchup(ch: Channel, prog: EpgProgram) {
+        if (parentalGatekeeper.isChannelRestricted(ch)) {
+            pendingParentalAction = { executePlayCatchup(ch, prog) }
+            ParentalPinChallengeDialog.newInstance(
+                title = "Restricted Channel",
+                message = "'${ch.title}' is locked by parental controls."
+            ).show(childFragmentManager, ParentalPinChallengeDialog.TAG)
+            return
+        }
+        executePlayCatchup(ch, prog)
     }
-}
 
-private fun checkParentalGateAndRun(
-    title: String,
-    groupTitle: String?,
-    targetId: String?,
-    action: () -> Unit
-) {
-    val restricted = parentalGatekeeper.isCategoryRestricted(groupTitle) ||
-        parentalGatekeeper.isTargetRestricted(targetId)
-    if (restricted) {
-        pendingParentalAction = action
-        vid.mat.app.ui.security.ParentalPinChallengeDialog.newInstance(
-            title = "Restricted Content",
-            message = "'$title' is protected by parental controls."
-        ).show(parentFragmentManager, vid.mat.app.ui.security.ParentalPinChallengeDialog.TAG)
-    } else {
-        action()
+    private fun executePlayCatchup(ch: Channel, prog: EpgProgram) {
+        lifecycleScope.launch {
+            val result = unifiedCatchupEngine.resolveCatchupDescriptor(ch.channelId, prog.startMs, prog.stopMs)
+            if (result.isFailure) {
+                Toast.makeText(
+                    requireContext(),
+                    result.exceptionOrNull()?.message ?: "Catch-up is unavailable for this program.",
+                    Toast.LENGTH_LONG
+                ).show()
+                return@launch
+            }
+
+            val catchupId = "catchup_${ch.channelId}_${prog.startMs}_${prog.stopMs}"
+            val intent = Intent(requireContext(), MediaPlayerActivity::class.java).apply {
+                putExtra(MediaPlayerActivity.EXTRA_MEDIA_PATH, catchupId)
+                putExtra(MediaPlayerActivity.EXTRA_MEDIA_TITLE, "${ch.title}: ${prog.title}")
+                putExtra(MediaPlayerActivity.EXTRA_MEDIA_THUMBNAIL, ch.logoUrl)
+                putExtra("group_title", ch.groupTitle)
+                putExtra(MediaPlayerActivity.EXTRA_RESUME_POSITION, 0L)
+            }
+            startActivity(intent)
+            dismiss()
+        }
     }
-}
-```
 
----
+    private fun openDvrDialog(ch: Channel, prog: EpgProgram) {
+        ScheduleRecordingDialogFragment.newInstance(ch, prog)
+            .show(parentFragmentManager, ScheduleRecordingDialogFragment.TAG)
+        dismiss()
+    }
 
-### 3. Cryptographic & Network Redirect Policy Hardening (`security/EncryptedField.kt`, `security/NetworkSecurityPolicy.kt`, `ui/security/ParentalControlSettingsActivity.kt`)
+    override fun onDestroyView() {
+        super.onDestroyView()
+        _binding = null
+    }
 
-#### `security/EncryptedField.kt` — Avoid passing corrupted/invalidated `ENC:` ciphertext strings back as plaintext
-```kotlin
-@TypeConverter
-fun toEncryptedField(storedValue: String?): EncryptedField? {
-    if (storedValue.isNullOrBlank()) return null
-    if (storedValue.startsWith("ENC:")) {
-        val parts = storedValue.removePrefix("ENC:").split(":")
-        if (parts.size == 2) {
-            val iv = parts[0]
-            val cipher = parts[1]
-            return when (val dec = CryptoUtils.decrypt(cipher, iv)) {
-                is CryptoUtils.DecryptionResult.Success -> EncryptedField(dec.plaintext)
-                else -> {
-                    vid.mat.app.util.AppLogger.w("EncryptedFieldConverter", "Failed decrypting encrypted field (${dec::class.simpleName})")
-                    null
+    @Suppress("DEPRECATION")
+    private fun readChannelArgument(): Channel? =
+        (arguments?.getParcelable(ARG_CHANNEL) as? Channel) ?: channel
+
+    @Suppress("DEPRECATION")
+    private fun readProgramArgument(): EpgProgram? =
+        (arguments?.getParcelable(ARG_PROGRAM) as? EpgProgram) ?: program
+
+    companion object {
+        const val TAG = "EpgProgramDetailsBottomSheet"
+        private const val ARG_CHANNEL = "arg_channel"
+        private const val ARG_PROGRAM = "arg_program"
+
+        fun newInstance(channel: Channel, program: EpgProgram): EpgProgramDetailsBottomSheet {
+            return EpgProgramDetailsBottomSheet().apply {
+                arguments = Bundle().apply {
+                    putParcelable(ARG_CHANNEL, channel)
+                    putParcelable(ARG_PROGRAM, program)
                 }
             }
         }
-        return null
     }
-    return EncryptedField(storedValue)
 }
-```
+""",
 
-#### `security/NetworkSecurityPolicy.kt` — Re-evaluate redirect destination context in `executeSafeHttpCall`
-```kotlin
-// Inside executeSafeHttpCall(...) redirect loop, replace `validateUri(nextUrl.toString(), context)` with:
-val effectiveRedirectContext = if (context in STREAM_CONTEXTS) {
-    resolveStreamContext(nextUrl.toString())
-} else {
-    context
-}
-val validation = validateUri(nextUrl.toString(), effectiveRedirectContext)
-if (validation !is UrlValidationResult.Valid) {
-    AppLogger.w(TAG, "executeSafeHttpCall: redirect to ${SensitiveDataSanitizer.sanitizeUrl(nextUrl.toString())} blocked: ${(validation as? UrlValidationResult.Invalid)?.reason}")
-    throw IOException("SSRF Redirect Blocked: target rejected by policy")
-}
-```
+    "favorites/ui/FavoritesFragment.kt": """package vid.mat.app.favorites.ui
 
-#### `ui/security/ParentalControlSettingsActivity.kt` — Allow setting PIN length 4–12 & verify existing PIN before disabling or changing PIN
-```kotlin
-private fun showSetPinDialog(onSuccess: () -> Unit) {
-    val input = EditText(this).apply {
-        inputType = android.text.InputType.TYPE_CLASS_NUMBER or android.text.InputType.TYPE_NUMBER_VARIATION_PASSWORD
-        setPadding(48, 32, 48, 16)
+import android.content.Intent
+import android.os.Bundle
+import android.view.LayoutInflater
+import android.view.View
+import android.view.ViewGroup
+import androidx.appcompat.widget.SearchView
+import androidx.fragment.app.Fragment
+import androidx.fragment.app.viewModels
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.repeatOnLifecycle
+import androidx.recyclerview.widget.GridLayoutManager
+import com.google.android.material.chip.Chip
+import dagger.hilt.android.AndroidEntryPoint
+import kotlinx.coroutines.launch
+import vid.mat.app.databinding.FragmentUnifiedFavoritesBinding
+import vid.mat.app.favorites.model.FavoriteType
+import vid.mat.app.favorites.model.UnifiedFavoriteEntity
+import vid.mat.app.security.ParentalGatekeeper
+import vid.mat.app.ui.MediaPlayerActivity
+import vid.mat.app.ui.security.ParentalPinChallengeDialog
+import vid.mat.app.ui.series.SeriesDetailsActivity
+import vid.mat.app.ui.vod.VodDetailsActivity
+import javax.inject.Inject
+
+@AndroidEntryPoint
+class FavoritesFragment : Fragment() {
+
+    private var _binding: FragmentUnifiedFavoritesBinding? = null
+    private val binding get() = _binding!!
+    private val viewModel: FavoritesViewModel by viewModels()
+
+    @Inject
+    lateinit var parentalGatekeeper: ParentalGatekeeper
+
+    private lateinit var adapter: UnifiedFavoriteAdapter
+    private var pendingParentalAction: (() -> Unit)? = null
+
+    override fun onCreateView(inflater: LayoutInflater, container: ViewGroup?, savedInstanceState: Bundle?): View {
+        _binding = FragmentUnifiedFavoritesBinding.inflate(inflater, container, false)
+        return binding.root
     }
 
-    MaterialAlertDialogBuilder(this)
-        .setTitle("Set Security PIN (4–12 Digits)")
-        .setMessage("Enter a numeric PIN to restrict access to locked content.")
-        .setView(input)
-        .setPositiveButton("Save PIN") { _, _ ->
-            val pin = input.text.toString().trim()
-            if (pin.length in 4..12 && pin.all(Char::isDigit)) {
-                parentalControlManager.setPin(pin)
-                onSuccess()
-            } else {
-                Toast.makeText(this, "PIN must be 4 to 12 digits", Toast.LENGTH_SHORT).show()
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        super.onViewCreated(view, savedInstanceState)
+
+        parentFragmentManager.setFragmentResultListener(
+            ParentalPinChallengeDialog.RESULT_KEY,
+            viewLifecycleOwner
+        ) { _, bundle ->
+            if (bundle.getBoolean(ParentalPinChallengeDialog.KEY_UNLOCKED, false)) {
+                parentFragmentManager.clearFragmentResult(ParentalPinChallengeDialog.RESULT_KEY)
+                val action = pendingParentalAction
+                pendingParentalAction = null
+                action?.invoke()
             }
         }
-        .setNegativeButton("Cancel", null)
-        .show()
-}
-```
 
----
+        setupRecycler()
+        setupSearch()
+        setupTypeChips()
+        observeFavorites()
+    }
 
-### Phase 14 Completion Notes
-- **Completed in code above**:
-  - `EncryptedBackupManager` & `BackupModels`: backed up hidden `CustomGroupEntity` rows and `ChannelUserOverrideEntity.isFavorite`, matched existing profiles by name instead of `REPLACE`-wiping `"Primary"`, cleared default flags cleanly, and skipped non-portable VOD/Series local-ID favorites.
-  - `BackupCreateDialogFragment`: preserved `targetPassphrase` across configuration changes via `onSaveInstanceState`.
-  - `ParentalControlManager` & `ParentalGatekeeper`: enforced `isAdultPattern` in `isCategoryRestricted` and wired parental PIN challenges into `EpgProgramDetailsBottomSheet`, `FavoritesFragment`, `UnifiedHistoryFragment`, and `HomeDashboardFragment`.
-  - `NetworkSecurityValidator.executeSafeHttpCall`: re-evaluates stream redirect contexts so remote streams cannot redirect to untrusted loopback ports.
-  - `ParentalControlSettingsActivity`: enforces the 4–12 numeric digit rule matching `ParentalControlManager.setPin`.
-
-Confirm when you are ready to proceed to **Phase 15 — Casting, notifications, and background lifecycle**.
-Below are **only the new or modified methods, attributes, and targeted edits** for **Phase 15 — Casting, Notifications, and Background Lifecycle**.
-
-*(No full classes are repeated.)*
-
----
-
-### 1. Google Cast URL/Credential Expansion, Live Stream Type & Safe Handoff (`CastManager.kt`, `PlayerCastController.kt`)
-
-#### `cast/CastManager.kt` — Support `STREAM_TYPE_LIVE` when casting live channels & preserve `isLive` on `StreamInfo`
-```kotlin
-// Add `isLive: Boolean = false` to StreamInfo:
-data class StreamInfo(
-    val url: String,
-    val title: String,
-    val thumbnailUrl: String? = null,
-    val positionMs: Long = 0L,
-    val mimeType: String = inferMimeType(url),
-    val userAgent: String? = null,
-    val isLive: Boolean = false
-)
-
-// Inside loadOnSession(session: CastSession, stream: StreamInfo):
-val mediaInfo = MediaInfo.Builder(stream.url)
-    .setStreamType(if (stream.isLive) MediaInfo.STREAM_TYPE_LIVE else MediaInfo.STREAM_TYPE_BUFFERED)
-    .setContentType(stream.mimeType)
-    .setMetadata(metadata)
-    .also { builder ->
-        if (!stream.userAgent.isNullOrBlank()) {
-            val customData = org.json.JSONObject().apply {
-                put("userAgent", stream.userAgent)
-            }
-            builder.setCustomData(customData)
+    private fun setupRecycler() {
+        adapter = UnifiedFavoriteAdapter(
+            onItemClick = { item -> playFavorite(item) },
+            onRemoveClick = { item -> viewModel.removeFavorite(item) }
+        )
+        binding.rvFavorites.apply {
+            layoutManager = GridLayoutManager(requireContext(), 2)
+            this.adapter = this@FavoritesFragment.adapter
+            setHasFixedSize(true)
         }
     }
-    .build()
 
-val loadRequest = MediaLoadRequestData.Builder()
-    .setMediaInfo(mediaInfo)
-    .setCurrentTime(if (stream.isLive) 0L else stream.positionMs)
-    .setAutoplay(true)
-    .build()
-```
+    private fun setupSearch() {
+        binding.searchView.setOnQueryTextListener(object : SearchView.OnQueryTextListener {
+            override fun onQueryTextSubmit(query: String?): Boolean = false
+            override fun onQueryTextChange(newText: String?): Boolean {
+                viewModel.setSearchQuery(newText.orEmpty())
+                return true
+            }
+        })
+    }
 
-#### `ui/player/PlayerCastController.kt` — Expand `/X-AUTH-INJECT/` credentials and reject uncastable local URIs cleanly
-```kotlin
-private fun prepareCurrentMedia(mediaItem: MediaItem?, titleProvider: () -> String) {
-    val rawUri = mediaItem?.localConfiguration?.uri?.toString()?.trim().orEmpty()
-    if (rawUri.isBlank()) return
+    private fun setupTypeChips() {
+        binding.chipGroupType.removeAllViews()
+        FavoriteType.entries.forEach { type ->
+            val chip = Chip(requireContext()).apply {
+                text = type.displayName
+                isCheckable = true
+                isChecked = type == FavoriteType.ALL
+                setOnCheckedChangeListener { _, isChecked ->
+                    if (isChecked) viewModel.selectType(type)
+                }
+            }
+            binding.chipGroupType.addView(chip)
+        }
+    }
 
-    // Local device files and loopback timeshift URLs cannot be fetched by a remote Chromecast receiver
-    if (rawUri.startsWith("content://", ignoreCase = true) ||
-        rawUri.startsWith("file://", ignoreCase = true) ||
-        rawUri.startsWith("/") ||
-        rawUri.startsWith("http://127.0.0.1", ignoreCase = true) ||
-        rawUri.startsWith("http://localhost", ignoreCase = true)
+    private fun observeFavorites() {
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewLifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {
+                viewModel.favoritesList.collect { list ->
+                    adapter.submitList(list)
+                    binding.layoutEmpty.visibility = if (list.isEmpty()) View.VISIBLE else View.GONE
+                }
+            }
+        }
+    }
+
+    private fun checkParentalGateAndRun(
+        title: String,
+        groupTitle: String?,
+        targetId: String?,
+        action: () -> Unit
     ) {
-        return
+        val restricted = parentalGatekeeper.isCategoryRestricted(groupTitle) ||
+            parentalGatekeeper.isTargetRestricted(targetId)
+        if (restricted) {
+            pendingParentalAction = action
+            ParentalPinChallengeDialog.newInstance(
+                title = "Restricted Content",
+                message = "'$title' is protected by parental controls."
+            ).show(parentFragmentManager, ParentalPinChallengeDialog.TAG)
+        } else {
+            action()
+        }
     }
 
-    val impl = viewModel.newPlayer as? vid.mat.app.player.NewPlayerImpl
-    val session = viewModel.newPlayer.currentSession.value
-    val activeCandidate = session?.mediaId?.let { mediaId ->
-        // Prefer resolved headers from the active session if available
-        (viewModel.newPlayer as? vid.mat.app.player.NewPlayerImpl)?.let { playerImpl ->
+    private fun playFavorite(item: UnifiedFavoriteEntity) {
+        checkParentalGateAndRun(item.title, item.groupTitle, item.targetId) {
+            when (item.type) {
+                FavoriteType.SERIES -> {
+                    val seriesDbId = item.targetId.removePrefix("series_").toLongOrNull() ?: return@checkParentalGateAndRun
+                    startActivity(
+                        Intent(requireContext(), SeriesDetailsActivity::class.java).apply {
+                            putExtra(SeriesDetailsActivity.EXTRA_SERIES_ID, seriesDbId)
+                        }
+                    )
+                }
+                FavoriteType.VOD_MOVIE -> {
+                    val movieDbId = item.targetId.removePrefix("movie_").toLongOrNull()
+                    if (movieDbId != null) {
+                        startActivity(
+                            Intent(requireContext(), VodDetailsActivity::class.java).apply {
+                                putExtra(VodDetailsActivity.EXTRA_MOVIE_ID, movieDbId)
+                            }
+                        )
+                    } else {
+                        launchPlayer(item.streamUrl, item)
+                    }
+                }
+                FavoriteType.LIVE_CHANNEL -> {
+                    val mediaKey = if (item.targetId.startsWith("live_identity:")) {
+                        item.targetId.removePrefix("live_identity:")
+                    } else {
+                        item.streamUrl.ifBlank { item.targetId }
+                    }
+                    launchPlayer(mediaKey, item)
+                }
+                else -> {
+                    if (item.streamUrl.isNotBlank()) launchPlayer(item.streamUrl, item)
+                }
+            }
+        }
+    }
+
+    private fun launchPlayer(mediaPath: String, item: UnifiedFavoriteEntity) {
+        if (mediaPath.isBlank()) return
+        val intent = Intent(requireContext(), MediaPlayerActivity::class.java).apply {
+            putExtra(MediaPlayerActivity.EXTRA_MEDIA_PATH, mediaPath)
+            putExtra(MediaPlayerActivity.EXTRA_MEDIA_TITLE, item.title)
+            putExtra(MediaPlayerActivity.EXTRA_MEDIA_THUMBNAIL, item.logoUrl)
+            putExtra("group_title", item.groupTitle)
+        }
+        startActivity(intent)
+    }
+
+    override fun onDestroyView() {
+        super.onDestroyView()
+        _binding = null
+    }
+}
+""",
+
+    "history/ui/UnifiedHistoryFragment.kt": """package vid.mat.app.history.ui
+
+import android.content.Intent
+import android.os.Bundle
+import android.view.LayoutInflater
+import android.view.View
+import android.view.ViewGroup
+import androidx.appcompat.widget.SearchView
+import androidx.fragment.app.Fragment
+import androidx.fragment.app.viewModels
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.repeatOnLifecycle
+import androidx.recyclerview.widget.ItemTouchHelper
+import androidx.recyclerview.widget.LinearLayoutManager
+import androidx.recyclerview.widget.RecyclerView
+import com.google.android.material.chip.Chip
+import com.google.android.material.dialog.MaterialAlertDialogBuilder
+import com.google.android.material.snackbar.Snackbar
+import dagger.hilt.android.AndroidEntryPoint
+import kotlinx.coroutines.launch
+import vid.mat.app.data.model.WatchProgressEntity
+import vid.mat.app.databinding.FragmentUnifiedHistoryBinding
+import vid.mat.app.security.ParentalGatekeeper
+import vid.mat.app.ui.MediaPlayerActivity
+import vid.mat.app.ui.security.ParentalPinChallengeDialog
+import javax.inject.Inject
+
+@AndroidEntryPoint
+class UnifiedHistoryFragment : Fragment() {
+
+    private var _binding: FragmentUnifiedHistoryBinding? = null
+    private val binding get() = _binding!!
+    private val viewModel: UnifiedHistoryViewModel by viewModels()
+
+    @Inject
+    lateinit var parentalGatekeeper: ParentalGatekeeper
+
+    private lateinit var adapter: UnifiedHistoryAdapter
+    private var pendingParentalAction: (() -> Unit)? = null
+
+    override fun onCreateView(inflater: LayoutInflater, container: ViewGroup?, savedInstanceState: Bundle?): View {
+        _binding = FragmentUnifiedHistoryBinding.inflate(inflater, container, false)
+        return binding.root
+    }
+
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        super.onViewCreated(view, savedInstanceState)
+
+        parentFragmentManager.setFragmentResultListener(
+            ParentalPinChallengeDialog.RESULT_KEY,
+            viewLifecycleOwner
+        ) { _, bundle ->
+            if (bundle.getBoolean(ParentalPinChallengeDialog.KEY_UNLOCKED, false)) {
+                parentFragmentManager.clearFragmentResult(ParentalPinChallengeDialog.RESULT_KEY)
+                val action = pendingParentalAction
+                pendingParentalAction = null
+                action?.invoke()
+            }
+        }
+
+        setupRecycler()
+        setupSearch()
+        setupTypeChips()
+        setupActions()
+        observeHistory()
+    }
+
+    private fun setupRecycler() {
+        adapter = UnifiedHistoryAdapter(
+            onItemClick = { item -> resumePlayback(item) },
+            onRestartClick = { item -> restartPlayback(item) },
+            onRemoveClick = { item -> viewModel.removeEntry(item.mediaKey) }
+        )
+
+        val touchHelper = ItemTouchHelper(object : ItemTouchHelper.SimpleCallback(0, ItemTouchHelper.LEFT or ItemTouchHelper.RIGHT) {
+            override fun onMove(rv: RecyclerView, vh: RecyclerView.ViewHolder, target: RecyclerView.ViewHolder): Boolean = false
+            override fun onSwiped(vh: RecyclerView.ViewHolder, direction: Int) {
+                val item = (adapter.currentList.getOrNull(vh.adapterPosition) as? HistoryDisplayItem.Entry)?.progress ?: return
+                viewModel.removeEntry(item.mediaKey)
+                Snackbar.make(binding.root, "Removed from history", Snackbar.LENGTH_SHORT).show()
+            }
+        })
+
+        binding.rvHistory.apply {
+            layoutManager = LinearLayoutManager(requireContext())
+            this.adapter = this@UnifiedHistoryFragment.adapter
+            touchHelper.attachToRecyclerView(this)
+            setHasFixedSize(true)
+        }
+    }
+
+    private fun setupSearch() {
+        binding.searchView.setOnQueryTextListener(object : SearchView.OnQueryTextListener {
+            override fun onQueryTextSubmit(query: String?): Boolean = false
+            override fun onQueryTextChange(newText: String?): Boolean {
+                viewModel.setSearchQuery(newText.orEmpty())
+                return true
+            }
+        })
+    }
+
+    private fun setupTypeChips() {
+        binding.chipGroupFilter.removeAllViews()
+        HistoryTypeFilter.entries.forEach { filter ->
+            val chip = Chip(requireContext()).apply {
+                text = filter.displayName
+                isCheckable = true
+                isChecked = filter == HistoryTypeFilter.ALL
+                setOnCheckedChangeListener { _, isChecked ->
+                    if (isChecked) viewModel.setTypeFilter(filter)
+                }
+            }
+            binding.chipGroupFilter.addView(chip)
+        }
+    }
+
+    private fun setupActions() {
+        binding.btnClearAll.setOnClickListener {
+            MaterialAlertDialogBuilder(requireContext())
+                .setTitle("Clear Watch History?")
+                .setMessage("All watch history and resume positions for this profile will be cleared.")
+                .setPositiveButton("Clear All") { _, _ -> viewModel.clearAllHistory() }
+                .setNegativeButton("Cancel", null)
+                .show()
+        }
+
+        binding.btnPauseHistory.setOnClickListener {
+            viewModel.togglePauseHistory()
+        }
+    }
+
+    private fun observeHistory() {
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewLifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {
+                viewModel.historyItems.collect { items ->
+                    adapter.submitList(items)
+                    binding.layoutEmpty.visibility = if (items.isEmpty()) View.VISIBLE else View.GONE
+                }
+            }
+        }
+
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewLifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {
+                viewModel.isHistoryPaused.collect { isPaused ->
+                    binding.btnPauseHistory.text = if (isPaused) "Resume History" else "Pause History"
+                }
+            }
+        }
+    }
+
+    private fun checkParentalGateAndRun(
+        title: String,
+        groupTitle: String?,
+        targetId: String?,
+        action: () -> Unit
+    ) {
+        val restricted = parentalGatekeeper.isCategoryRestricted(groupTitle) ||
+            parentalGatekeeper.isTargetRestricted(targetId)
+        if (restricted) {
+            pendingParentalAction = action
+            ParentalPinChallengeDialog.newInstance(
+                title = "Restricted Content",
+                message = "'$title' is protected by parental controls."
+            ).show(parentFragmentManager, ParentalPinChallengeDialog.TAG)
+        } else {
+            action()
+        }
+    }
+
+    private fun resumePlayback(item: WatchProgressEntity) {
+        checkParentalGateAndRun(item.mediaTitle, item.mediaSubtitle, item.mediaKey) {
+            val intent = Intent(requireContext(), MediaPlayerActivity::class.java).apply {
+                putExtra(MediaPlayerActivity.EXTRA_MEDIA_PATH, item.streamUrl)
+                putExtra(MediaPlayerActivity.EXTRA_MEDIA_TITLE, item.mediaTitle)
+                putExtra(MediaPlayerActivity.EXTRA_MEDIA_THUMBNAIL, item.thumbnailUrl)
+                putExtra(MediaPlayerActivity.EXTRA_RESUME_POSITION, item.positionMs)
+                putExtra("group_title", item.mediaSubtitle)
+            }
+            startActivity(intent)
+        }
+    }
+
+    private fun restartPlayback(item: WatchProgressEntity) {
+        checkParentalGateAndRun(item.mediaTitle, item.mediaSubtitle, item.mediaKey) {
+            val intent = Intent(requireContext(), MediaPlayerActivity::class.java).apply {
+                putExtra(MediaPlayerActivity.EXTRA_MEDIA_PATH, item.streamUrl)
+                putExtra(MediaPlayerActivity.EXTRA_MEDIA_TITLE, item.mediaTitle)
+                putExtra(MediaPlayerActivity.EXTRA_MEDIA_THUMBNAIL, item.thumbnailUrl)
+                putExtra(MediaPlayerActivity.EXTRA_RESUME_POSITION, 0L)
+                putExtra("group_title", item.mediaSubtitle)
+            }
+            startActivity(intent)
+        }
+    }
+
+    override fun onDestroyView() {
+        super.onDestroyView()
+        _binding = null
+    }
+}
+"""
+}
+
+
+def main() -> None:
+    if not BASE_DIR.exists():
+        raise SystemExit(f"Target directory does not exist: {BASE_DIR}")
+
+    for rel_path, content in FILES.items():
+        target = BASE_DIR / rel_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+        print(f"Updated: {target}")
+
+    print(f"Done. Wrote {len(FILES)} files.")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+May I proceed with **Batch 9 (5 classes — Home Dashboard, Crypto/Network Hardening & Parental Settings)** (`home/ui/HomeDashboardFragment.kt`, `home/SmartHomeDashboardRepository.kt`, `home/ui/HomeDashboardSectionAdapter.kt`, `security/EncryptedField.kt`, `security/NetworkSecurityPolicy.kt`)?
+Here is the Python script for **Batch 9 (5 classes — Home Dashboard & Security Hardening)**:
+
+1. `home/ui/HomeDashboardFragment.kt` — Fixes `binding.layoutEmpty.root` visibility bug, passes `EXTRA_MEDIA_THUMBNAIL` on Continue cards, and enforces `ParentalGatekeeper` + PIN challenge on card clicks.
+2. `home/SmartHomeDashboardRepository.kt` — Uses the Room `SeriesEntity.id` primary key (instead of provider `seriesId`) when constructing `HomeCardItem.SeriesCard`.
+3. `home/ui/HomeDashboardSectionAdapter.kt` — Reuses `MediaCardAdapter` and shares `OptimizedViewPoolFactory.getSharedViewPool()` across horizontal rows.
+4. `security/EncryptedField.kt` — Returns `null` instead of leaking `ENC:` ciphertext strings when decryption fails or format is malformed.
+5. `security/NetworkSecurityPolicy.kt` — Re-evaluates `resolveStreamContext(nextUrl.toString())` during stream redirects in `executeSafeHttpCall`.
+
+```python
+#!/usr/bin/env python3
+from pathlib import Path
+
+BASE_DIR = Path("/home/username/AndroidStudioProjects/Ytvmate/app/src/main/java/vid/mat/app")
+
+FILES = {
+    "home/ui/HomeDashboardFragment.kt": """package vid.mat.app.home.ui
+
+import android.content.Intent
+import android.os.Bundle
+import android.view.LayoutInflater
+import android.view.View
+import android.view.ViewGroup
+import androidx.fragment.app.Fragment
+import androidx.fragment.app.viewModels
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.repeatOnLifecycle
+import androidx.recyclerview.widget.LinearLayoutManager
+import dagger.hilt.android.AndroidEntryPoint
+import kotlinx.coroutines.launch
+import vid.mat.app.databinding.FragmentHomeDashboardBinding
+import vid.mat.app.home.model.HomeCardItem
+import vid.mat.app.security.ParentalGatekeeper
+import vid.mat.app.ui.MediaPlayerActivity
+import vid.mat.app.ui.security.ParentalPinChallengeDialog
+import vid.mat.app.ui.series.SeriesDetailsActivity
+import vid.mat.app.ui.vod.VodDetailsActivity
+import javax.inject.Inject
+
+@AndroidEntryPoint
+class HomeDashboardFragment : Fragment() {
+
+    private var _binding: FragmentHomeDashboardBinding? = null
+    private val binding get() = _binding!!
+    private val viewModel: HomeDashboardViewModel by viewModels()
+
+    @Inject
+    lateinit var parentalGatekeeper: ParentalGatekeeper
+
+    private lateinit var sectionAdapter: HomeDashboardSectionAdapter
+    private var pendingParentalAction: (() -> Unit)? = null
+
+    override fun onCreateView(
+        inflater: LayoutInflater,
+        container: ViewGroup?,
+        savedInstanceState: Bundle?
+    ): View {
+        _binding = FragmentHomeDashboardBinding.inflate(inflater, container, false)
+        return binding.root
+    }
+
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        super.onViewCreated(view, savedInstanceState)
+
+        parentFragmentManager.setFragmentResultListener(
+            ParentalPinChallengeDialog.RESULT_KEY,
+            viewLifecycleOwner
+        ) { _, bundle ->
+            if (bundle.getBoolean(ParentalPinChallengeDialog.KEY_UNLOCKED, false)) {
+                parentFragmentManager.clearFragmentResult(ParentalPinChallengeDialog.RESULT_KEY)
+                val action = pendingParentalAction
+                pendingParentalAction = null
+                action?.invoke()
+            }
+        }
+
+        setupRecycler()
+        observeDashboard()
+    }
+
+    private fun setupRecycler() {
+        sectionAdapter = HomeDashboardSectionAdapter { card ->
+            handleCardClick(card)
+        }
+        binding.rvDashboardSections.apply {
+            layoutManager = LinearLayoutManager(requireContext())
+            adapter = sectionAdapter
+            setHasFixedSize(true)
+        }
+    }
+
+    private fun observeDashboard() {
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewLifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {
+                viewModel.dashboardState.collect { state ->
+                    sectionAdapter.submitList(state.sections)
+                    binding.layoutEmpty.root.visibility =
+                        if (state.sections.isEmpty() && !state.isLoading) View.VISIBLE else View.GONE
+                }
+            }
+        }
+    }
+
+    private fun checkParentalGateAndRun(
+        title: String,
+        groupTitle: String?,
+        targetId: String?,
+        action: () -> Unit
+    ) {
+        val restricted = parentalGatekeeper.isCategoryRestricted(groupTitle) ||
+            parentalGatekeeper.isTargetRestricted(targetId)
+        if (restricted) {
+            pendingParentalAction = action
+            ParentalPinChallengeDialog.newInstance(
+                title = "Restricted Content",
+                message = "'$title' is protected by parental controls."
+            ).show(parentFragmentManager, ParentalPinChallengeDialog.TAG)
+        } else {
+            action()
+        }
+    }
+
+    private fun handleCardClick(card: HomeCardItem) {
+        when (card) {
+            is HomeCardItem.LiveChannelCard -> {
+                checkParentalGateAndRun(card.title, card.subtitle, card.channelIdentity) {
+                    val intent = Intent(requireContext(), MediaPlayerActivity::class.java).apply {
+                        putExtra(MediaPlayerActivity.EXTRA_MEDIA_PATH, card.channelIdentity)
+                        putExtra(MediaPlayerActivity.EXTRA_MEDIA_TITLE, card.title)
+                        putExtra(MediaPlayerActivity.EXTRA_MEDIA_THUMBNAIL, card.imageUrl)
+                        putExtra("group_title", card.subtitle)
+                    }
+                    startActivity(intent)
+                }
+            }
+            is HomeCardItem.MovieCard -> {
+                checkParentalGateAndRun(card.title, card.subtitle, "movie_${card.movieId}") {
+                    val intent = Intent(requireContext(), VodDetailsActivity::class.java).apply {
+                        putExtra(VodDetailsActivity.EXTRA_MOVIE_ID, card.movieId)
+                    }
+                    startActivity(intent)
+                }
+            }
+            is HomeCardItem.ContinueWatchingCard -> {
+                checkParentalGateAndRun(card.title, card.subtitle, card.id) {
+                    val intent = Intent(requireContext(), MediaPlayerActivity::class.java).apply {
+                        putExtra(MediaPlayerActivity.EXTRA_MEDIA_PATH, card.streamUrl)
+                        putExtra(MediaPlayerActivity.EXTRA_MEDIA_TITLE, card.title)
+                        putExtra(MediaPlayerActivity.EXTRA_MEDIA_THUMBNAIL, card.imageUrl)
+                        putExtra(MediaPlayerActivity.EXTRA_RESUME_POSITION, card.resumePositionMs)
+                        putExtra("group_title", card.subtitle)
+                    }
+                    startActivity(intent)
+                }
+            }
+            is HomeCardItem.SeriesCard -> {
+                checkParentalGateAndRun(card.title, card.subtitle, "series_${card.seriesId}") {
+                    val intent = Intent(requireContext(), SeriesDetailsActivity::class.java).apply {
+                        putExtra(SeriesDetailsActivity.EXTRA_SERIES_ID, card.seriesId)
+                    }
+                    startActivity(intent)
+                }
+            }
+        }
+    }
+
+    override fun onDestroyView() {
+        super.onDestroyView()
+        _binding = null
+    }
+}
+""",
+
+    "home/SmartHomeDashboardRepository.kt": """package vid.mat.app.home
+
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.flowOn
+import vid.mat.app.data.model.Channel
+import vid.mat.app.data.model.SeriesEntity
+import vid.mat.app.data.model.VodMovieEntity
+import vid.mat.app.data.model.WatchProgressEntity
+import vid.mat.app.data.repository.ChannelRepository
+import vid.mat.app.data.repository.SeriesRepository
+import vid.mat.app.data.repository.VodRepository
+import vid.mat.app.history.WatchProgressManager
+import vid.mat.app.home.model.HomeCardItem
+import vid.mat.app.home.model.HomeDashboardSection
+import vid.mat.app.home.model.HomeSectionData
+import vid.mat.app.profile.ActiveProfileProvider
+import vid.mat.app.security.ParentalGatekeeper
+import javax.inject.Inject
+import javax.inject.Singleton
+
+@Singleton
+class SmartHomeDashboardRepository @Inject constructor(
+    private val watchProgressManager: WatchProgressManager,
+    private val channelRepository: ChannelRepository,
+    private val vodRepository: VodRepository,
+    private val seriesRepository: SeriesRepository,
+    private val activeProfileProvider: ActiveProfileProvider,
+    private val parentalGatekeeper: ParentalGatekeeper
+) {
+
+    private data class DashboardInputs(
+        val continueItems: List<WatchProgressEntity>,
+        val favChannels: List<Channel>,
+        val recentChannels: List<Channel>,
+        val favMovies: List<VodMovieEntity>,
+        val favSeries: List<SeriesEntity>
+    )
+
+    fun getDashboardSections(): Flow<List<HomeSectionData>> = combine(
+        watchProgressManager.continueWatching,
+        channelRepository.favorites,
+        channelRepository.recents,
+        vodRepository.favorites,
+        seriesRepository.favorites
+    ) { continueItems, favChannels, recentChannels, favMovies, favSeries ->
+        DashboardInputs(
+            continueItems = continueItems,
+            favChannels = favChannels,
+            recentChannels = recentChannels,
+            favMovies = favMovies,
+            favSeries = favSeries
+        )
+    }.combine(activeProfileProvider.activeProfile) { inputs, _ ->
+        buildSections(inputs)
+    }.flowOn(Dispatchers.IO)
+
+    private fun buildSections(inputs: DashboardInputs): List<HomeSectionData> {
+        val sections = mutableListOf<HomeSectionData>()
+
+        val filteredContinue = inputs.continueItems.filterNot { item ->
+            parentalGatekeeper.isCategoryRestricted(item.mediaSubtitle) ||
+                parentalGatekeeper.isTargetRestricted(item.mediaKey)
+        }
+        if (filteredContinue.isNotEmpty()) {
+            val cards = filteredContinue.map { c ->
+                HomeCardItem.ContinueWatchingCard(
+                    id = c.mediaKey,
+                    title = c.mediaTitle,
+                    subtitle = c.mediaSubtitle,
+                    imageUrl = c.thumbnailUrl,
+                    streamUrl = c.streamUrl,
+                    resumePositionMs = c.positionMs,
+                    progressPercent = c.completionPercent
+                )
+            }
+            sections.add(HomeSectionData(HomeDashboardSection.CONTINUE_WATCHING, "Continue Watching", cards))
+        }
+
+        val filteredFavChannels = inputs.favChannels.filterNot { ch -> parentalGatekeeper.isChannelRestricted(ch) }
+        val filteredFavMovies   = inputs.favMovies.filterNot   { m  -> parentalGatekeeper.isMovieRestricted(m) }
+        val filteredFavSeries   = inputs.favSeries.filterNot   { s  -> parentalGatekeeper.isSeriesRestricted(s) }
+
+        val favoriteCards = mutableListOf<HomeCardItem>()
+
+        filteredFavChannels.forEach { ch ->
+            favoriteCards.add(
+                HomeCardItem.LiveChannelCard(
+                    id = "fav_ch_${ch.channelId}",
+                    title = ch.title,
+                    subtitle = ch.groupTitle,
+                    imageUrl = ch.logoUrl,
+                    channelIdentity = ch.channelIdentity
+                )
+            )
+        }
+        filteredFavMovies.forEach { m ->
+            favoriteCards.add(
+                HomeCardItem.MovieCard(
+                    id = "fav_mov_${m.id}",
+                    title = m.title,
+                    subtitle = m.categoryName,
+                    imageUrl = m.posterUrl ?: m.backdropUrl,
+                    movieId = m.id
+                )
+            )
+        }
+        filteredFavSeries.forEach { s ->
+            favoriteCards.add(
+                HomeCardItem.SeriesCard(
+                    id = "fav_series_${s.id}",
+                    title = s.title,
+                    subtitle = s.genre ?: s.categoryName,
+                    imageUrl = s.coverUrl ?: s.backdropUrl,
+                    seriesId = s.id
+                )
+            )
+        }
+        if (favoriteCards.isNotEmpty()) {
+            sections.add(HomeSectionData(HomeDashboardSection.FAVORITES, "Favorites", favoriteCards))
+        }
+
+        val filteredRecents = inputs.recentChannels.filterNot { ch -> parentalGatekeeper.isChannelRestricted(ch) }
+        if (filteredRecents.isNotEmpty()) {
+            val recentsCards = filteredRecents.map { ch ->
+                HomeCardItem.LiveChannelCard(
+                    id = "rec_${ch.channelId}",
+                    title = ch.title,
+                    subtitle = ch.groupTitle,
+                    imageUrl = ch.logoUrl,
+                    channelIdentity = ch.channelIdentity
+                )
+            }
+            sections.add(HomeSectionData(HomeDashboardSection.RECENTLY_WATCHED, "Recently Watched", recentsCards))
+        }
+
+        return sections.sortedByDescending { it.section.basePriority }
+    }
+}
+""",
+
+    "home/ui/HomeDashboardSectionAdapter.kt": """package vid.mat.app.home.ui
+
+import android.view.LayoutInflater
+import android.view.View
+import android.view.ViewGroup
+import android.widget.ProgressBar
+import android.widget.TextView
+import androidx.recyclerview.widget.DiffUtil
+import androidx.recyclerview.widget.LinearLayoutManager
+import androidx.recyclerview.widget.ListAdapter
+import androidx.recyclerview.widget.RecyclerView
+import vid.mat.app.R
+import vid.mat.app.databinding.ItemHomeMediaCardBinding
+import vid.mat.app.databinding.ItemHomeSectionRowBinding
+import vid.mat.app.home.model.HomeCardItem
+import vid.mat.app.home.model.HomeSectionData
+import vid.mat.app.image.LogoImageLoader
+import vid.mat.app.util.performance.OptimizedViewPoolFactory
+
+class HomeDashboardSectionAdapter(
+    private val onCardClick: (HomeCardItem) -> Unit
+) : ListAdapter<HomeSectionData, HomeDashboardSectionAdapter.SectionViewHolder>(DiffCallback()) {
+
+    private val sharedCardPool = OptimizedViewPoolFactory.getSharedViewPool()
+
+    override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): SectionViewHolder {
+        val binding = ItemHomeSectionRowBinding.inflate(LayoutInflater.from(parent.context), parent, false)
+        return SectionViewHolder(binding, onCardClick, sharedCardPool)
+    }
+
+    override fun onBindViewHolder(holder: SectionViewHolder, position: Int) {
+        holder.bind(getItem(position))
+    }
+
+    class SectionViewHolder(
+        private val binding: ItemHomeSectionRowBinding,
+        onCardClick: (HomeCardItem) -> Unit,
+        sharedPool: RecyclerView.RecycledViewPool
+    ) : RecyclerView.ViewHolder(binding.root) {
+
+        private val cardAdapter = MediaCardAdapter(onCardClick)
+
+        init {
+            binding.rvSectionItems.apply {
+                layoutManager = LinearLayoutManager(binding.root.context, LinearLayoutManager.HORIZONTAL, false)
+                adapter = cardAdapter
+                setRecycledViewPool(sharedPool)
+                setHasFixedSize(true)
+            }
+        }
+
+        fun bind(section: HomeSectionData) {
+            binding.tvSectionTitle.text = section.title
+            cardAdapter.submitList(section.items)
+        }
+    }
+
+    class MediaCardAdapter(
+        private val onClick: (HomeCardItem) -> Unit
+    ) : ListAdapter<HomeCardItem, MediaCardAdapter.CardVH>(CardDiff()) {
+
+        override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): CardVH {
+            val binding = ItemHomeMediaCardBinding.inflate(LayoutInflater.from(parent.context), parent, false)
+            return CardVH(binding)
+        }
+
+        override fun onBindViewHolder(holder: CardVH, position: Int) {
+            holder.bind(getItem(position), onClick)
+        }
+
+        class CardVH(val binding: ItemHomeMediaCardBinding) : RecyclerView.ViewHolder(binding.root) {
+            fun bind(item: HomeCardItem, onClick: (HomeCardItem) -> Unit) {
+                binding.tvTitle.text = item.title
+                binding.tvSubtitle.text = item.subtitle ?: ""
+
+                val tvBadge = binding.root.findViewById<TextView?>(R.id.tvBadge)
+                val progressBar = binding.root.findViewById<ProgressBar?>(R.id.progressBar)
+
+                if (item is HomeCardItem.LiveChannelCard) {
+                    tvBadge?.visibility = View.VISIBLE
+                } else {
+                    tvBadge?.visibility = View.GONE
+                }
+
+                if (item is HomeCardItem.ContinueWatchingCard) {
+                    progressBar?.visibility = View.VISIBLE
+                    progressBar?.progress = item.progressPercent
+                } else {
+                    progressBar?.visibility = View.GONE
+                }
+
+                LogoImageLoader.load(binding.ivPoster.context, item.title, item.imageUrl, binding.ivPoster, 10f)
+                binding.root.setOnClickListener { onClick(item) }
+            }
+        }
+
+        class CardDiff : DiffUtil.ItemCallback<HomeCardItem>() {
+            override fun areItemsTheSame(a: HomeCardItem, b: HomeCardItem) = a.id == b.id
+            override fun areContentsTheSame(a: HomeCardItem, b: HomeCardItem) = a == b
+        }
+    }
+
+    class DiffCallback : DiffUtil.ItemCallback<HomeSectionData>() {
+        override fun areItemsTheSame(a: HomeSectionData, b: HomeSectionData) = a.section == b.section
+        override fun areContentsTheSame(a: HomeSectionData, b: HomeSectionData) = a == b
+    }
+}
+""",
+
+    "security/EncryptedField.kt": """package vid.mat.app.security
+
+import android.os.Parcelable
+import androidx.room.TypeConverter
+import kotlinx.parcelize.Parcelize
+import vid.mat.app.util.AppLogger
+
+/**
+ * Strongly-typed wrapper for credential-bearing database columns.
+ * Redacts value in toString() to prevent accidental plaintext leaks in logs.
+ */
+@Parcelize
+data class EncryptedField(val value: String) : Parcelable {
+    override fun toString(): String = "[REDACTED]"
+
+    companion object {
+        fun from(value: String?): EncryptedField? =
+            if (!value.isNullOrBlank()) EncryptedField(value.trim()) else null
+    }
+}
+
+class EncryptedFieldConverter {
+
+    @TypeConverter
+    fun toEncryptedField(storedValue: String?): EncryptedField? {
+        if (storedValue.isNullOrBlank()) return null
+        if (storedValue.startsWith("ENC:")) {
+            val parts = storedValue.removePrefix("ENC:").split(":")
+            if (parts.size == 2) {
+                val iv = parts[0]
+                val cipher = parts[1]
+                return when (val dec = CryptoUtils.decrypt(cipher, iv)) {
+                    is CryptoUtils.DecryptionResult.Success -> EncryptedField(dec.plaintext)
+                    else -> {
+                        AppLogger.w("EncryptedFieldConverter", "Failed decrypting encrypted field (${dec::class.simpleName})")
+                        null
+                    }
+                }
+            }
+            return null
+        }
+        return EncryptedField(storedValue)
+    }
+
+    @TypeConverter
+    fun fromEncryptedField(field: EncryptedField?): String? {
+        val plaintext = field?.value ?: return null
+        if (plaintext.isBlank()) return null
+        return when (val enc = CryptoUtils.encrypt(plaintext)) {
+            is CryptoUtils.EncryptionResult.Success -> "ENC:${enc.result.ivBase64}:${enc.result.ciphertextBase64}"
+            is CryptoUtils.EncryptionResult.Failure -> null
+            else -> null
+        }
+    }
+}
+""",
+
+    "security/NetworkSecurityPolicy.kt": """package vid.mat.app.security
+
+import android.net.Uri
+import okhttp3.Dns
+import okhttp3.HttpUrl
+import okhttp3.Interceptor
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.Response
+import org.json.JSONObject
+import vid.mat.app.network.BoundedResponseReader
+import vid.mat.app.player.timeshift.TimeshiftLocalServer
+import vid.mat.app.util.AppLogger
+import vid.mat.app.util.SensitiveDataSanitizer
+import java.io.File
+import java.io.IOException
+import java.net.Inet4Address
+import java.net.Inet6Address
+import java.net.InetAddress
+import java.net.URI
+import java.net.URLEncoder
+import java.net.UnknownHostException
+import java.nio.charset.StandardCharsets
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.TimeUnit
+
+enum class NetworkSecurityContext {
+    REMOTE_PLAYLIST,
+    REMOTE_EPG,
+    XTREAM_API,
+    PUBLIC_WEB,
+    IPTV_STREAM,
+    LOCAL_IPTV_GATEWAY,
+    LOCAL_TIMESHIFT_LOOPBACK,
+    LOCAL_FILE_SYSTEM
+}
+
+object NetworkSecurityValidator {
+
+    private const val TAG = "NetworkSecurityValidator"
+    private const val MAX_URL_LENGTH = 8_192
+    private const val MAX_REDIRECT_DEPTH = 5
+
+    private val HTTP_SCHEMES = setOf("http", "https")
+    private val STREAMING_SCHEMES = setOf("rtmp", "rtmps", "rtsp", "udp", "rtp", "mms", "mmsh")
+    private val LOCAL_MEDIA_SCHEMES = setOf("content", "file", "asset", "android.resource")
+    private val STREAM_CONTEXTS = setOf(
+        NetworkSecurityContext.IPTV_STREAM,
+        NetworkSecurityContext.LOCAL_IPTV_GATEWAY,
+        NetworkSecurityContext.LOCAL_TIMESHIFT_LOOPBACK
+    )
+
+    private val CLOUD_METADATA_IPS = setOf(
+        "169.254.169.254",
+        "169.254.170.2",
+        "100.100.100.200"
+    )
+
+    private val CLOUD_METADATA_HOSTS = setOf(
+        "metadata.google.internal",
+        "instance-data",
+        "metadata.packet.net",
+        "169.254.169.254"
+    )
+
+    private val INJECTION_PATTERNS = listOf(
+        " ", "%00", "<script", "javascript:", "vbscript:", "data:"
+    )
+
+    private val LOOPBACK_HOST_LITERALS = setOf("localhost", "127.0.0.1", "::1")
+    private val NUMERIC_HOST_REGEX = Regex("""^[0-9a-fA-F:.\[\]]+$""")
+
+    private val trustedLoopbackPorts: MutableSet<Int> = ConcurrentHashMap.newKeySet()
+
+    fun sanitizeHeaderValue(value: String?): String? {
+        if (value == null) return null
+        return value.replace("\r", "").replace("\n", "").trim()
+    }
+
+    fun registerTrustedLoopbackOrigin(port: Int) {
+        if (port in 1..65_535) {
+            trustedLoopbackPorts.add(port)
+            AppLogger.i(TAG, "Registered trusted loopback origin on port $port")
+        } else {
+            AppLogger.w(TAG, "Attempt to register invalid loopback port $port (ignored)")
+        }
+    }
+
+    fun unregisterTrustedLoopbackOrigin(port: Int) {
+        trustedLoopbackPorts.remove(port)
+        AppLogger.d(TAG, "Unregistered trusted loopback origin on port $port")
+    }
+
+    fun hasActiveTrustedLoopbackOrigin(): Boolean {
+        val active = trustedLoopbackPorts.isNotEmpty()
+        AppLogger.d(TAG, "hasActiveTrustedLoopbackOrigin=$active (ports=${trustedLoopbackPorts.joinToString()})")
+        return active
+    }
+
+    fun isTrustedLoopbackPort(port: Int): Boolean {
+        val trusted = trustedLoopbackPorts.contains(port)
+        AppLogger.d(TAG, "isTrustedLoopbackPort($port)=$trusted")
+        return trusted
+    }
+
+    fun isLoopbackHostLiteral(host: String?): Boolean {
+        if (host.isNullOrBlank()) {
+            AppLogger.d(TAG, "isLoopbackHostLiteral: host blank -> false")
+            return false
+        }
+        val normalized = host.lowercase().removeSurrounding("[", "]")
+        val result = LOOPBACK_HOST_LITERALS.contains(normalized)
+        AppLogger.d(TAG, "isLoopbackHostLiteral($host) -> $result")
+        return result
+    }
+
+    fun parseNumericAddress(host: String?): InetAddress? {
+        if (host.isNullOrBlank()) {
+            AppLogger.d(TAG, "parseNumericAddress: host blank -> null")
+            return null
+        }
+        val candidate = host.removeSurrounding("[", "]")
+        if (!NUMERIC_HOST_REGEX.matches(candidate)) {
+            AppLogger.d(TAG, "parseNumericAddress: $host doesn't match numeric regex -> null")
+            return null
+        }
+        if (!candidate.contains('.') && !candidate.contains(':')) {
+            AppLogger.d(TAG, "parseNumericAddress: $host lacks dot or colon -> null")
+            return null
+        }
+        val address = runCatching { InetAddress.getByName(candidate) }.getOrNull()
+        AppLogger.d(TAG, "parseNumericAddress($host) -> ${address?.hostAddress}")
+        return address
+    }
+
+    fun isPrivateAddressLiteral(host: String?): Boolean {
+        val address = parseNumericAddress(host) ?: return false
+        if (address.isLoopbackAddress || address.isLinkLocalAddress ||
+            address.isAnyLocalAddress || address.isMulticastAddress
+        ) {
+            AppLogger.d(TAG, "isPrivateAddressLiteral($host): special address -> false")
+            return false
+        }
+
+        val result = when (address) {
+            is Inet4Address -> {
+                val b = address.address
+                val b0 = b[0].toInt() and 0xFF
+                val b1 = b[1].toInt() and 0xFF
+                (b0 == 10) || (b0 == 172 && b1 in 16..31) ||
+                    (b0 == 192 && b1 == 168) || (b0 == 100 && b1 in 64..127)
+            }
+            is Inet6Address -> {
+                (address.address[0].toInt() and 0xFE) == 0xFC
+            }
+            else -> false
+        }
+        AppLogger.d(TAG, "isPrivateAddressLiteral($host) -> $result")
+        return result
+    }
+
+    fun resolveStreamContext(rawUrl: String?): NetworkSecurityContext {
+        if (rawUrl == null) {
+            AppLogger.d(TAG, "resolveStreamContext(null) -> IPTV_STREAM")
+            return NetworkSecurityContext.IPTV_STREAM
+        }
+        val trimmed = rawUrl.trim()
+
+        if (trimmed.startsWith("/") || LOCAL_MEDIA_SCHEMES.any { trimmed.startsWith("$it:", ignoreCase = true) }) {
+            AppLogger.d(TAG, "resolveStreamContext(${SensitiveDataSanitizer.sanitizeUrl(rawUrl)}) -> LOCAL_FILE_SYSTEM (local path or media scheme)")
+            return NetworkSecurityContext.LOCAL_FILE_SYSTEM
+        }
+
+        val host = extractHost(trimmed)
+        if (isLoopbackHostLiteral(host)) {
+            val port = extractPort(trimmed)
+            val context = if (port != -1 && isTrustedLoopbackPort(port)) {
+                NetworkSecurityContext.LOCAL_TIMESHIFT_LOOPBACK
+            } else {
+                NetworkSecurityContext.IPTV_STREAM
+            }
+            AppLogger.d(TAG, "resolveStreamContext(${SensitiveDataSanitizer.sanitizeUrl(rawUrl)}) -> $context (loopback host, port=$port)")
+            return context
+        }
+
+        if (isPrivateAddressLiteral(host)) {
+            AppLogger.d(TAG, "resolveStreamContext(${SensitiveDataSanitizer.sanitizeUrl(rawUrl)}) -> LOCAL_IPTV_GATEWAY (private address)")
+            return NetworkSecurityContext.LOCAL_IPTV_GATEWAY
+        }
+
+        AppLogger.d(TAG, "resolveStreamContext(${SensitiveDataSanitizer.sanitizeUrl(rawUrl)}) -> IPTV_STREAM (default)")
+        return NetworkSecurityContext.IPTV_STREAM
+    }
+
+    sealed interface UrlValidationResult {
+        data class Valid(val sanitizedUrl: String, val uri: Uri? = null) : UrlValidationResult
+        data class Invalid(val reason: String) : UrlValidationResult
+    }
+
+    fun validateUri(
+        rawUrl: String?,
+        context: NetworkSecurityContext,
+        timeshiftServer: TimeshiftLocalServer? = null
+    ): UrlValidationResult {
+        AppLogger.d(TAG, "validateUri: url='${SensitiveDataSanitizer.sanitizeUrl(rawUrl)}', context=$context, timeshiftServer=${timeshiftServer != null}")
+
+        if (rawUrl.isNullOrBlank()) {
+            AppLogger.w(TAG, "validateUri: URL is blank")
+            return UrlValidationResult.Invalid("URL is blank")
+        }
+
+        val trimmed = rawUrl.trim()
+        if (trimmed.length > MAX_URL_LENGTH) {
+            AppLogger.w(TAG, "validateUri: URL length ${trimmed.length} exceeds $MAX_URL_LENGTH")
+            return UrlValidationResult.Invalid("URL length exceeds $MAX_URL_LENGTH chars")
+        }
+
+        val isLocalInput = context == NetworkSecurityContext.LOCAL_FILE_SYSTEM ||
+            trimmed.startsWith("/") ||
+            LOCAL_MEDIA_SCHEMES.any { trimmed.startsWith("$it:", ignoreCase = true) }
+
+        val lower = trimmed.lowercase()
+        for (pattern in INJECTION_PATTERNS) {
+            if (pattern == " " && isLocalInput) continue
+            if (lower.contains(pattern)) {
+                AppLogger.w(TAG, "validateUri: injection pattern '$pattern' found in URL")
+                return UrlValidationResult.Invalid("Forbidden injection sequence: $pattern")
+            }
+        }
+
+        if (trimmed.startsWith("/")) {
+            val fileUri = runCatching { Uri.fromFile(File(trimmed)) }.getOrNull()
+            val result = UrlValidationResult.Valid(trimmed, fileUri ?: createSafeUri(trimmed))
+            AppLogger.d(TAG, "validateUri: local file path -> valid")
+            return result
+        }
+
+        val scheme = extractScheme(trimmed)
+        if (scheme == null) {
+            AppLogger.w(TAG, "validateUri: URI scheme missing")
+            return UrlValidationResult.Invalid("URI scheme missing")
+        }
+
+        val allowedSchemes = when (context) {
+            NetworkSecurityContext.REMOTE_PLAYLIST,
+            NetworkSecurityContext.REMOTE_EPG,
+            NetworkSecurityContext.XTREAM_API,
+            NetworkSecurityContext.PUBLIC_WEB -> HTTP_SCHEMES
+            NetworkSecurityContext.LOCAL_TIMESHIFT_LOOPBACK -> setOf("http")
+            NetworkSecurityContext.IPTV_STREAM,
+            NetworkSecurityContext.LOCAL_IPTV_GATEWAY -> HTTP_SCHEMES + STREAMING_SCHEMES
+            NetworkSecurityContext.LOCAL_FILE_SYSTEM -> LOCAL_MEDIA_SCHEMES + HTTP_SCHEMES
+        }
+
+        if (scheme !in allowedSchemes) {
+            AppLogger.w(TAG, "validateUri: scheme '$scheme' disallowed for context $context")
+            return UrlValidationResult.Invalid("Scheme '$scheme' disallowed for context $context")
+        }
+
+        if (context == NetworkSecurityContext.LOCAL_FILE_SYSTEM || scheme in LOCAL_MEDIA_SCHEMES) {
+            AppLogger.d(TAG, "validateUri: local file system or local scheme -> valid")
+            return UrlValidationResult.Valid(trimmed, createSafeUri(trimmed))
+        }
+
+        val host = extractHost(trimmed)
+        if (host.isNullOrBlank()) {
+            AppLogger.w(TAG, "validateUri: URI host missing")
+            return UrlValidationResult.Invalid("URI host missing")
+        }
+        val lowerHost = host.lowercase()
+
+        if (CLOUD_METADATA_HOSTS.any { lowerHost == it || lowerHost.endsWith(".$it") } || CLOUD_METADATA_IPS.contains(lowerHost)) {
+            AppLogger.w(TAG, "validateUri: cloud metadata access blocked for host '$host'")
+            return UrlValidationResult.Invalid("Cloud metadata access is strictly blocked")
+        }
+
+        val port = extractPort(trimmed)
+        if (port != -1 && (port < 1 || port > 65_535)) {
+            AppLogger.w(TAG, "validateUri: port $port out of range")
+            return UrlValidationResult.Invalid("Port $port out of valid range (1..65535)")
+        }
+
+        val isLoopbackHost = isLoopbackHostLiteral(lowerHost)
+        if (isLoopbackHost) {
+            if (context != NetworkSecurityContext.LOCAL_TIMESHIFT_LOOPBACK && !isTrustedLoopbackPort(port)) {
+                AppLogger.w(TAG, "validateUri: loopback restricted (context=$context, port=$port)")
+                return UrlValidationResult.Invalid("Loopback restricted to internal Timeshift only")
+            }
+
+            if (timeshiftServer != null && port != timeshiftServer.serverPort) {
+                AppLogger.w(TAG, "validateUri: loopback port $port does not match timeshift server port ${timeshiftServer.serverPort}")
+                return UrlValidationResult.Invalid("Loopback port mismatch")
+            } else if (!isTrustedLoopbackPort(port)) {
+                AppLogger.w(TAG, "validateUri: loopback port $port not registered as trusted")
+                return UrlValidationResult.Invalid("Loopback port $port not registered as trusted")
+            }
+        }
+
+        val sanitized = trimmed.substringBefore('#')
+        AppLogger.d(TAG, "validateUri: valid -> sanitized='${SensitiveDataSanitizer.sanitizeUrl(sanitized)}'")
+        return UrlValidationResult.Valid(sanitized, createSafeUri(sanitized))
+    }
+
+    private fun extractScheme(url: String): String? {
+        val colonIdx = url.indexOf(':')
+        if (colonIdx <= 0) return null
+        val schemePart = url.substring(0, colonIdx).lowercase()
+        val isValid = schemePart.all { it.isLetterOrDigit() || it == '+' || it == '-' || it == '.' }
+        val result = if (isValid) schemePart else null
+        AppLogger.d(TAG, "extractScheme(${SensitiveDataSanitizer.sanitizeUrl(url)}) -> $result")
+        return result
+    }
+
+    private fun extractHost(url: String?): String? {
+        if (url == null) return null
+        val standardHost = runCatching { URI(url).host }.getOrNull()
+        if (standardHost != null) {
+            AppLogger.d(TAG, "extractHost(${SensitiveDataSanitizer.sanitizeUrl(url)}) -> $standardHost (URI parser)")
+            return standardHost
+        }
+
+        val result = runCatching {
+            val noScheme = if (url.contains("://")) url.substringAfter("://") else url
+            val authority = noScheme.substringBefore('/').substringBefore('?').substringBefore('#')
+            val hostPort = if (authority.contains('@')) authority.substringAfter('@') else authority
+            if (hostPort.startsWith('[')) {
+                hostPort.substringBefore(']') + "]"
+            } else {
+                hostPort.substringBefore(':')
+            }
+        }.getOrNull()?.takeIf { it.isNotBlank() }
+        AppLogger.d(TAG, "extractHost(${SensitiveDataSanitizer.sanitizeUrl(url)}) -> $result (manual)")
+        return result
+    }
+
+    private fun extractPort(url: String?): Int {
+        if (url == null) return -1
+        val javaUriPort = runCatching { URI(url).port }.getOrDefault(-1)
+        if (javaUriPort != -1) {
+            AppLogger.d(TAG, "extractPort(${SensitiveDataSanitizer.sanitizeUrl(url)}) -> $javaUriPort (URI parser)")
+            return javaUriPort
+        }
+
+        val result = runCatching {
+            val noScheme = if (url.contains("://")) url.substringAfter("://") else url
+            val authority = noScheme.substringBefore('/').substringBefore('?').substringBefore('#')
+            val hostPort = if (authority.contains('@')) authority.substringAfter('@') else authority
+            val portStr = if (hostPort.startsWith('[')) {
+                hostPort.substringAfter(']', "").substringAfter(':', "")
+            } else {
+                hostPort.substringAfter(':', "")
+            }
+            portStr.toIntOrNull() ?: -1
+        }.getOrDefault(-1)
+        AppLogger.d(TAG, "extractPort(${SensitiveDataSanitizer.sanitizeUrl(url)}) -> $result (manual)")
+        return result
+    }
+
+    private fun createSafeUri(url: String): Uri? {
+        return try {
+            Uri.parse(url)
+        } catch (_: Throwable) {
             null
         }
     }
 
-    // Expand Xtream credentials if the MediaItem URI still holds /X-AUTH-INJECT/
-    val resolvedUrl = expandCastUrlIfNeeded(rawUri) ?: return
-    val metadata = mediaItem?.mediaMetadata
-    val title = metadata?.displayTitle?.toString()
-        ?: metadata?.title?.toString()
-        ?: titleProvider()
-    val thumbnail = metadata?.artworkUri?.toString()
-    val isLive = session?.playbackType == vid.mat.app.player.PlaybackType.LIVE
+    fun isAddressForbidden(address: InetAddress, context: NetworkSecurityContext): Boolean {
+        AppLogger.d(TAG, "isAddressForbidden: address=${address.hostAddress}, context=$context")
 
-    castManager.prepareStream(
-        CastManager.StreamInfo(
-            url = resolvedUrl,
-            title = title.ifBlank { "Stream" },
-            thumbnailUrl = thumbnail,
-            positionMs = if (isLive) 0L else viewModel.newPlayer.currentPosition.coerceAtLeast(0L),
-            isLive = isLive
-        )
-    )
+        if (context == NetworkSecurityContext.LOCAL_FILE_SYSTEM) {
+            AppLogger.d(TAG, "isAddressForbidden: LOCAL_FILE_SYSTEM -> false")
+            return false
+        }
+
+        if (address.isLoopbackAddress) {
+            val forbidden = context != NetworkSecurityContext.LOCAL_TIMESHIFT_LOOPBACK
+            AppLogger.d(TAG, "isAddressForbidden: loopback -> $forbidden (context=$context)")
+            return forbidden
+        }
+
+        if (address.isMulticastAddress || address.isAnyLocalAddress ||
+            address.isLinkLocalAddress
+        ) {
+            AppLogger.d(TAG, "isAddressForbidden: multicast/any/link-local -> true")
+            return true
+        }
+
+        if (address.isSiteLocalAddress &&
+            context != NetworkSecurityContext.IPTV_STREAM &&
+            context != NetworkSecurityContext.LOCAL_IPTV_GATEWAY
+        ) {
+            AppLogger.d(TAG, "isAddressForbidden: site-local address in non-streaming context -> true")
+            return true
+        }
+
+        val effectiveIpv4: Inet4Address? = when {
+            address is Inet4Address -> address
+            address is Inet6Address && isIpv4MappedAddress(address) -> extractIpv4FromMapped(address)
+            address is Inet6Address && is6to4Address(address) -> extractIpv4From6to4(address)
+            else -> null
+        }
+
+        if (effectiveIpv4 != null) {
+            val ipStr = effectiveIpv4.hostAddress ?: ""
+            if (CLOUD_METADATA_IPS.contains(ipStr)) {
+                AppLogger.w(TAG, "isAddressForbidden: cloud metadata IP $ipStr -> true")
+                return true
+            }
+
+            val bytes = effectiveIpv4.address
+            val b0 = bytes[0].toInt() and 0xFF
+            val b1 = bytes[1].toInt() and 0xFF
+            val b2 = bytes[2].toInt() and 0xFF
+
+            if (b0 == 0) return true
+            if (b0 == 127) return context != NetworkSecurityContext.LOCAL_TIMESHIFT_LOOPBACK
+            if (b0 == 169 && b1 == 254) return true
+            if (b0 == 192 && b1 == 0 && b2 == 2) return true
+            if (b0 == 198 && (b1 in 18..19)) return true
+            if (b0 == 198 && b1 == 51 && b2 == 100) return true
+            if (b0 == 203 && b1 == 0 && b2 == 113) return true
+            if (b0 >= 224) return true
+
+            val isPrivateSubnet = (b0 == 10) || (b0 == 172 && b1 in 16..31) ||
+                (b0 == 192 && b1 == 168) || (b0 == 100 && b1 in 64..127)
+
+            if (isPrivateSubnet) {
+                val isStreamingContext = context == NetworkSecurityContext.IPTV_STREAM ||
+                    context == NetworkSecurityContext.LOCAL_IPTV_GATEWAY
+                return !isStreamingContext
+            }
+            return false
+        }
+
+        if (address is Inet6Address) {
+            val rawBytes = address.address
+
+            if ((rawBytes[0].toInt() and 0xFE) == 0xFC) {
+                val isStreamingContext = context == NetworkSecurityContext.IPTV_STREAM ||
+                    context == NetworkSecurityContext.LOCAL_IPTV_GATEWAY
+                return !isStreamingContext
+            }
+
+            if (address.isLoopbackAddress) {
+                return context != NetworkSecurityContext.LOCAL_TIMESHIFT_LOOPBACK
+            }
+
+            return false
+        }
+
+        return false
+    }
+
+    private fun isIpv4MappedAddress(ipv6: Inet6Address): Boolean {
+        val bytes = ipv6.address
+        for (i in 0..9) if (bytes[i] != 0.toByte()) return false
+        return bytes[10] == 0xFF.toByte() && bytes[11] == 0xFF.toByte()
+    }
+
+    private fun extractIpv4FromMapped(ipv6: Inet6Address): Inet4Address? {
+        val bytes = ipv6.address
+        val ipv4Bytes = byteArrayOf(bytes[12], bytes[13], bytes[14], bytes[15])
+        return runCatching { InetAddress.getByAddress(ipv4Bytes) as? Inet4Address }.getOrNull()
+    }
+
+    private fun is6to4Address(ipv6: Inet6Address): Boolean {
+        val bytes = ipv6.address
+        return bytes[0] == 0x20.toByte() && bytes[1] == 0x02.toByte()
+    }
+
+    private fun extractIpv4From6to4(ipv6: Inet6Address): Inet4Address? {
+        val bytes = ipv6.address
+        val ipv4Bytes = byteArrayOf(bytes[2], bytes[3], bytes[4], bytes[5])
+        return runCatching { InetAddress.getByAddress(ipv4Bytes) as? Inet4Address }.getOrNull()
+    }
+
+    object ResilientDns {
+        private val dohClient by lazy {
+            OkHttpClient.Builder()
+                .connectTimeout(4, TimeUnit.SECONDS)
+                .readTimeout(4, TimeUnit.SECONDS)
+                .callTimeout(5, TimeUnit.SECONDS)
+                .build()
+        }
+
+        fun lookup(hostname: String): List<InetAddress> {
+            AppLogger.d(TAG, "ResilientDns.lookup: resolving host '$hostname'")
+            try {
+                val results = Dns.SYSTEM.lookup(hostname)
+                if (results.isNotEmpty()) {
+                    return results
+                }
+            } catch (_: UnknownHostException) {
+            }
+
+            val encodedHost = runCatching {
+                URLEncoder.encode(hostname, StandardCharsets.UTF_8.name())
+            }.getOrElse { hostname }
+
+            resolveDoH("https://1.1.1.1/dns-query?name=$encodedHost&type=A")?.let { aRecords ->
+                if (aRecords.isNotEmpty()) {
+                    val aaaa = resolveDoH("https://1.1.1.1/dns-query?name=$encodedHost&type=AAAA").orEmpty()
+                    return (aRecords + aaaa).distinctBy { address -> address.hostAddress }
+                }
+            }
+
+            resolveDoH("https://dns.google/resolve?name=$encodedHost&type=A")?.let { aRecords ->
+                if (aRecords.isNotEmpty()) {
+                    val aaaa = resolveDoH("https://dns.google/resolve?name=$encodedHost&type=AAAA").orEmpty()
+                    return (aRecords + aaaa).distinctBy { address -> address.hostAddress }
+                }
+            }
+
+            resolveDoH("https://1.1.1.1/dns-query?name=$encodedHost&type=AAAA")?.let {
+                if (it.isNotEmpty()) return it.distinctBy { address -> address.hostAddress }
+            }
+            resolveDoH("https://dns.google/resolve?name=$encodedHost&type=AAAA")?.let {
+                if (it.isNotEmpty()) return it.distinctBy { address -> address.hostAddress }
+            }
+
+            throw UnknownHostException("Unable to resolve host \"$hostname\": No address associated with hostname")
+        }
+
+        private fun resolveDoH(url: String): List<InetAddress>? {
+            return try {
+                val request = Request.Builder()
+                    .url(url)
+                    .header("Accept", "application/dns-json")
+                    .build()
+
+                dohClient.newCall(request).execute().use { response ->
+                    if (!response.isSuccessful) return null
+                    val jsonStr = response.body?.let { BoundedResponseReader.readUtf8(it, 1L * 1024L * 1024L) } ?: return null
+                    val json = JSONObject(jsonStr)
+                    val answers = json.optJSONArray("Answer") ?: return null
+
+                    val ips = mutableListOf<InetAddress>()
+                    for (i in 0 until answers.length()) {
+                        val obj = answers.optJSONObject(i) ?: continue
+                        when (obj.optInt("type", -1)) {
+                            1, 28 -> {
+                                val ip = obj.optString("data").trim()
+                                if (ip.isNotBlank()) {
+                                    runCatching { InetAddress.getByName(ip) }.getOrNull()?.let(ips::add)
+                                }
+                            }
+                        }
+                    }
+                    ips.distinctBy { it.hostAddress }.takeIf { it.isNotEmpty() }
+                }
+            } catch (_: Exception) {
+                null
+            }
+        }
+    }
+
+    class SafeDns(private val context: NetworkSecurityContext) : Dns {
+        @Throws(IOException::class)
+        override fun lookup(hostname: String): List<InetAddress> {
+            val addresses = ResilientDns.lookup(hostname)
+            val forbiddenAddresses = addresses.filter { isAddressForbidden(it, context) }
+            if (forbiddenAddresses.isNotEmpty()) {
+                AppLogger.w(TAG, "SafeDns: SSRF blocked for '$hostname' -> ${forbiddenAddresses.joinToString { it.hostAddress }}")
+                throw IOException("SSRF Blocked: Host '$hostname' resolves to restricted destination")
+            }
+            return addresses
+        }
+    }
+
+    class ContextDispatchingDns(
+        private val fallbackContext: NetworkSecurityContext = NetworkSecurityContext.IPTV_STREAM
+    ) : Dns {
+        @Throws(IOException::class)
+        override fun lookup(hostname: String): List<InetAddress> {
+            val effectiveContext = when {
+                isLoopbackHostLiteral(hostname) -> {
+                    if (hasActiveTrustedLoopbackOrigin()) NetworkSecurityContext.LOCAL_TIMESHIFT_LOOPBACK
+                    else fallbackContext
+                }
+                isPrivateAddressLiteral(hostname) -> NetworkSecurityContext.LOCAL_IPTV_GATEWAY
+                else -> fallbackContext
+            }
+
+            val addresses = ResilientDns.lookup(hostname)
+            val forbiddenAddresses = addresses.filter { isAddressForbidden(it, effectiveContext) }
+            if (forbiddenAddresses.isNotEmpty()) {
+                AppLogger.w(TAG, "ContextDispatchingDns: SSRF blocked for '$hostname' -> ${forbiddenAddresses.joinToString { it.hostAddress }}")
+                throw IOException("SSRF Blocked: Host '$hostname' resolves to restricted destination")
+            }
+            return addresses
+        }
+    }
+
+    class RedirectGuardInterceptor(
+        private val contextResolver: (HttpUrl) -> NetworkSecurityContext
+    ) : Interceptor {
+        @Throws(IOException::class)
+        override fun intercept(chain: Interceptor.Chain): Response {
+            var currentRequest = chain.request()
+            var redirectCount = 0
+
+            while (true) {
+                val currentContext = contextResolver(currentRequest.url)
+                val validation = validateUri(currentRequest.url.toString(), currentContext)
+                if (validation !is UrlValidationResult.Valid) {
+                    val reason = (validation as? UrlValidationResult.Invalid)?.reason ?: "policy violation"
+                    throw IOException("Network policy blocked '${currentRequest.url.host}': $reason")
+                }
+
+                val response = chain.proceed(currentRequest)
+                if (!response.isRedirect) {
+                    return response
+                }
+
+                val location = response.header("Location")
+                response.close()
+                if (location.isNullOrBlank()) {
+                    throw IOException("Redirect missing Location header")
+                }
+
+                val nextUrl = currentRequest.url.resolve(location)
+                    ?: throw IOException("Malformed redirect location: $location")
+
+                redirectCount++
+                if (redirectCount > MAX_REDIRECT_DEPTH) {
+                    throw IOException("SSRF Violation: Max redirect depth exceeded ($MAX_REDIRECT_DEPTH)")
+                }
+
+                val nextContext = contextResolver(nextUrl)
+                val nextValidation = validateUri(nextUrl.toString(), nextContext)
+                if (nextValidation !is UrlValidationResult.Valid) {
+                    throw IOException("SSRF Redirect Blocked: '$nextUrl' rejected by policy")
+                }
+
+                val isCrossOrigin = currentRequest.url.host != nextUrl.host ||
+                    currentRequest.url.port != nextUrl.port ||
+                    currentRequest.url.scheme != nextUrl.scheme
+
+                val requestBuilder = currentRequest.newBuilder().url(nextValidation.sanitizedUrl)
+                if (isCrossOrigin) {
+                    requestBuilder.removeHeader("Authorization")
+                    requestBuilder.removeHeader("Cookie")
+                    requestBuilder.removeHeader("Proxy-Authorization")
+                }
+                currentRequest = requestBuilder.build()
+            }
+        }
+    }
+
+    @Throws(IOException::class)
+    fun executeSafeHttpCall(
+        client: OkHttpClient,
+        initialRequest: Request,
+        context: NetworkSecurityContext
+    ): Response {
+        val dns: Dns = if (context in STREAM_CONTEXTS) {
+            ContextDispatchingDns(NetworkSecurityContext.IPTV_STREAM)
+        } else {
+            SafeDns(context)
+        }
+
+        val safeClient = client.newBuilder()
+            .dns(dns)
+            .followRedirects(false)
+            .followSslRedirects(false)
+            .build()
+
+        var currentRequest = initialRequest
+        var redirectCount = 0
+
+        while (true) {
+            val response = safeClient.newCall(currentRequest).execute()
+            if (!response.isRedirect) {
+                return response
+            }
+
+            redirectCount++
+            if (redirectCount > MAX_REDIRECT_DEPTH) {
+                response.close()
+                throw IOException("SSRF Violation: Max redirect depth exceeded ($MAX_REDIRECT_DEPTH)")
+            }
+
+            val location = response.header("Location")
+            response.close()
+            if (location.isNullOrBlank()) {
+                throw IOException("Redirect missing Location header")
+            }
+
+            val nextUrl = currentRequest.url.resolve(location)
+                ?: throw IOException("Malformed redirect location: $location")
+
+            val effectiveRedirectContext = if (context in STREAM_CONTEXTS) {
+                resolveStreamContext(nextUrl.toString())
+            } else {
+                context
+            }
+            val validation = validateUri(nextUrl.toString(), effectiveRedirectContext)
+            if (validation !is UrlValidationResult.Valid) {
+                AppLogger.w(TAG, "executeSafeHttpCall: redirect to ${SensitiveDataSanitizer.sanitizeUrl(nextUrl.toString())} blocked: ${(validation as? UrlValidationResult.Invalid)?.reason}")
+                throw IOException("SSRF Redirect Blocked: target rejected by policy")
+            }
+
+            val isCrossOrigin = currentRequest.url.host != nextUrl.host ||
+                currentRequest.url.port != nextUrl.port ||
+                currentRequest.url.scheme != nextUrl.scheme
+            val requestBuilder = currentRequest.newBuilder().url(nextUrl)
+
+            if (isCrossOrigin) {
+                requestBuilder.removeHeader("Authorization")
+                requestBuilder.removeHeader("Cookie")
+                requestBuilder.removeHeader("Proxy-Authorization")
+            }
+
+            currentRequest = requestBuilder.build()
+        }
+    }
+}
+"""
 }
 
-private fun expandCastUrlIfNeeded(rawUrl: String): String? {
-    if (!rawUrl.contains("/X-AUTH-INJECT/")) return rawUrl
-    val session = viewModel.newPlayer.currentSession.value ?: return null
-    val candidate = (activity as? vid.mat.app.ui.MediaPlayerActivity)?.failoverEngine?.getActiveCandidate(session.mediaId)
-        ?: return null
-    val user = candidate.headers.xtreamUser ?: return null
-    val pass = candidate.headers.xtreamPass ?: return null
-    return rawUrl.replace(
-        "/X-AUTH-INJECT/",
-        "/${android.net.Uri.encode(user)}/${android.net.Uri.encode(pass)}/"
-    )
-}
+
+def main() -> None:
+    if not BASE_DIR.exists():
+        raise SystemExit(f"Target directory does not exist: {BASE_DIR}")
+
+    for rel_path, content in FILES.items():
+        target = BASE_DIR / rel_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+        print(f"Updated: {target}")
+
+    print(f"Done. Wrote {len(FILES)} files.")
+
+
+if __name__ == "__main__":
+    main()
 ```
 
----
+May I proceed with **Batch 10 (5 classes — Parental PIN, Casting & Boot/Lifecycle)** (`ui/security/ParentalControlSettingsActivity.kt`, `cast/CastManager.kt`, `ui/player/PlayerCastController.kt`, `notification/BootCompletedReceiver.kt`, `lifecycle/AppLifecycleSupervisor.kt`)?
+thought
+Let's carefully verify the 5 classes for **Batch 10**:
+1. `ui/security/ParentalControlSettingsActivity.kt`
+   - Phase 14 change:
+     - `showSetPinDialog`: enforces 4–12 numeric digits (`pin.length in 4..12 && pin.all(Char::isDigit)`).
+     - Notice in `ParentalControlSettingsActivity.kt` line 41: if user disables or changes PIN when `parentalControlManager.isParentalControlActive` is true, wait—did Phase 14 only show `showSetPinDialog`? Let's check the Phase 14 paste: yes, `showSetPinDialog` checks `pin.length in 4..12 && pin.all(Char::isDigit)`. Let's keep the rest intact and clean.
+2. `cast/CastManager.kt`
+   - Phase 15 change:
+     - Add `val isLive: Boolean = false` to `StreamInfo`.
+     - In `loadOnSession`: set `.setStreamType(if (stream.isLive) MediaInfo.STREAM_TYPE_LIVE else MediaInfo.STREAM_TYPE_BUFFERED)` and `.setCurrentTime(if (stream.isLive) 0L else stream.positionMs)`.
+3. `ui/player/PlayerCastController.kt`
+   - Phase 15 change:
+     - Reject local/loopback URIs (`content://`, `file://`, `/`, `http://127.0.0.1`, `http://localhost`).
+     - Expand `/X-AUTH-INJECT/` credentials via `expandCastUrlIfNeeded` using `(activity as? MediaPlayerActivity)?.failoverEngine?.getActiveCandidate(session.mediaId)`.
+     - Pass `isLive = session?.playbackType == PlaybackType.LIVE` and `positionMs = if (isLive) 0L else viewModel.newPlayer.currentPosition.coerceAtLeast(0L)`.
+4. `notification/BootCompletedReceiver.kt`
+   - Phase 15 change:
+     - Inject `database: VideoUrlDatabase`.
+     - Use `goAsync()` + `CoroutineScope(Dispatchers.IO).launch` to reschedule `EpgRefreshWorker.schedule(context, ...)` for manual EPG URL and all distinct playlist source EPG URLs on boot.
+5. `lifecycle/AppLifecycleSupervisor.kt`
+   - Phase 15 change:
+     - Wrap `workManager.getWorkInfosForUniqueWork("dvr_work_${recording.id}").get()` in `runCatching { ... }.getOrDefault(emptyList())`.
+     - Filter `allValidRecordings` to only `DvrStatus.COMPLETED` or `DvrStatus.PARTIAL` when building `validPaths` for `storageManager.cleanupOrphanedFiles(validPaths)`.
 
-### 2. Notifications, Boot Rescheduling & Background Lifecycle (`BootCompletedReceiver.kt`, `AppLifecycleSupervisor.kt`, `PlaybackLifecycleCoordinator.kt`, `EpgRefreshWorker.kt`)
+Let's double-check all imports and generate the Python script for Batch 10.Here is the Python script for **Batch 10 (5 classes — Parental PIN, Google Cast & Background Lifecycle)**:
 
-#### `notification/BootCompletedReceiver.kt` — Reschedule EPG background sync & reconcile interrupted DVR jobs on device reboot
-```kotlin
-@Inject
-lateinit var database: vid.mat.app.data.database.VideoUrlDatabase
+1. `ui/security/ParentalControlSettingsActivity.kt` — Enforces 4–12 numeric digits in `showSetPinDialog` matching `ParentalControlManager.setPin`.
+2. `cast/CastManager.kt` — Adds `isLive: Boolean = false` on `StreamInfo` and sets `MediaInfo.STREAM_TYPE_LIVE` for Live TV casting.
+3. `ui/player/PlayerCastController.kt` — Rejects uncastable local/loopback URIs, expands `/X-AUTH-INJECT/` credentials before casting, and sets `isLive`.
+4. `notification/BootCompletedReceiver.kt` — Uses `goAsync()` to reschedule `EpgRefreshWorker` for manual and playlist source EPG URLs after reboot.
+5. `lifecycle/AppLifecycleSupervisor.kt` — Safely wraps `WorkManager.getWorkInfosForUniqueWork().get()` and retains only `COMPLETED`/`PARTIAL` recording paths during orphan file cleanup.
 
-override fun onReceive(context: Context, intent: Intent) {
-    if (intent.action == Intent.ACTION_BOOT_COMPLETED || intent.action == "android.intent.action.QUICKBOOT_POWERON") {
-        AppLogger.i("BootCompletedReceiver", "Device reboot detected -> Re-initializing channels and scheduled EPG/DVR workers")
-        notificationManager.createAllNotificationChannels()
+```python
+#!/usr/bin/env python3
+from pathlib import Path
 
-        val pendingResult = goAsync()
-        kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
-            try {
-                val epgPrefs = context.getSharedPreferences("epg_prefs", Context.MODE_PRIVATE)
-                val manualEpg = epgPrefs.getString("epg_url", "").orEmpty().trim()
-                if (manualEpg.isNotBlank()) {
-                    vid.mat.app.epg.EpgRefreshWorker.schedule(context, manualEpg)
+BASE_DIR = Path("/home/username/AndroidStudioProjects/Ytvmate/app/src/main/java/vid/mat/app")
+
+FILES = {
+    "ui/security/ParentalControlSettingsActivity.kt": """package vid.mat.app.ui.security
+
+import android.os.Bundle
+import android.text.InputType
+import android.view.LayoutInflater
+import android.view.View
+import android.view.ViewGroup
+import android.widget.EditText
+import android.widget.TextView
+import android.widget.Toast
+import androidx.activity.enableEdgeToEdge
+import androidx.appcompat.app.AppCompatActivity
+import androidx.lifecycle.lifecycleScope
+import androidx.recyclerview.widget.LinearLayoutManager
+import androidx.recyclerview.widget.RecyclerView
+import com.google.android.material.dialog.MaterialAlertDialogBuilder
+import dagger.hilt.android.AndroidEntryPoint
+import kotlinx.coroutines.launch
+import vid.mat.app.R
+import vid.mat.app.data.repository.ChannelRepository
+import vid.mat.app.databinding.ActivityParentalSettingsBinding
+import vid.mat.app.security.ParentalControlManager
+import javax.inject.Inject
+
+@AndroidEntryPoint
+class ParentalControlSettingsActivity : AppCompatActivity() {
+
+    private lateinit var binding: ActivityParentalSettingsBinding
+
+    @Inject
+    lateinit var parentalControlManager: ParentalControlManager
+
+    @Inject
+    lateinit var channelRepository: ChannelRepository
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        enableEdgeToEdge()
+        binding = ActivityParentalSettingsBinding.inflate(layoutInflater)
+        setContentView(binding.root)
+
+        binding.btnBack.setOnClickListener { finish() }
+
+        binding.switchParentalEnabled.isChecked = parentalControlManager.isParentalControlActive
+        binding.switchParentalEnabled.setOnCheckedChangeListener { _, isChecked ->
+            if (isChecked && !parentalControlManager.isParentalControlActive) {
+                showSetPinDialog {
+                    parentalControlManager.setParentalControlEnabled(true)
                 }
-                database.playlistSourceDao().getAll()
-                    .mapNotNull { it.epgUrl?.trim()?.takeIf { url -> url.isNotBlank() } }
-                    .distinct()
-                    .forEach { url ->
-                        vid.mat.app.epg.EpgRefreshWorker.schedule(context, url)
+            } else {
+                parentalControlManager.setParentalControlEnabled(isChecked)
+            }
+        }
+
+        binding.btnChangePin.setOnClickListener {
+            showSetPinDialog {
+                Toast.makeText(this, "PIN updated successfully", Toast.LENGTH_SHORT).show()
+            }
+        }
+
+        setupCategoriesList()
+    }
+
+    private fun setupCategoriesList() {
+        binding.rvLockedCategories.layoutManager = LinearLayoutManager(this)
+        lifecycleScope.launch {
+            channelRepository.distinctGroups.collect { groups ->
+                val lockedSet = parentalControlManager.getLockedCategories()
+                binding.rvLockedCategories.adapter = CategoryLockAdapter(groups, lockedSet) { category, isLocked ->
+                    if (isLocked) parentalControlManager.lockCategory(category)
+                    else parentalControlManager.unlockCategory(category)
+                }
+            }
+        }
+    }
+
+    private fun showSetPinDialog(onSuccess: () -> Unit) {
+        val input = EditText(this).apply {
+            inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_VARIATION_PASSWORD
+            setPadding(48, 32, 48, 16)
+        }
+
+        MaterialAlertDialogBuilder(this)
+            .setTitle("Set Security PIN (4–12 Digits)")
+            .setMessage("Enter a numeric PIN to restrict access to locked content.")
+            .setView(input)
+            .setPositiveButton("Save PIN") { _, _ ->
+                val pin = input.text.toString().trim()
+                if (pin.length in 4..12 && pin.all(Char::isDigit)) {
+                    parentalControlManager.setPin(pin)
+                    onSuccess()
+                } else {
+                    Toast.makeText(this, "PIN must be 4 to 12 digits", Toast.LENGTH_SHORT).show()
+                }
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private class CategoryLockAdapter(
+        private val categories: List<String>,
+        private val lockedSet: Set<String>,
+        private val onToggle: (String, Boolean) -> Unit
+    ) : RecyclerView.Adapter<CategoryLockAdapter.VH>() {
+
+        override fun getItemCount(): Int = categories.size
+
+        override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): VH {
+            val view = LayoutInflater.from(parent.context).inflate(R.layout.item_category_drawer, parent, false)
+            return VH(view)
+        }
+
+        override fun onBindViewHolder(holder: VH, position: Int) {
+            val cat = categories[position]
+            holder.tvName.text = cat
+            val isLocked = lockedSet.contains(cat.lowercase().trim())
+            holder.tvCount.text = if (isLocked) "LOCKED" else "UNLOCKED"
+            holder.tvCount.setTextColor(if (isLocked) 0xFFEF4444.toInt() else 0xFF10B981.toInt())
+
+            holder.itemView.setOnClickListener {
+                onToggle(cat, !isLocked)
+                notifyItemChanged(position)
+            }
+        }
+
+        class VH(v: View) : RecyclerView.ViewHolder(v) {
+            val tvName: TextView = v.findViewById(R.id.tvCategoryName)
+            val tvCount: TextView = v.findViewById(R.id.tvCategoryCount)
+        }
+    }
+}
+""",
+
+    "cast/CastManager.kt": """package vid.mat.app.cast
+
+import android.content.Context
+import androidx.core.net.toUri
+import com.google.android.gms.cast.MediaInfo
+import com.google.android.gms.cast.MediaLoadRequestData
+import com.google.android.gms.cast.MediaMetadata
+import com.google.android.gms.cast.framework.CastContext
+import com.google.android.gms.cast.framework.CastSession
+import com.google.android.gms.cast.framework.SessionManagerListener
+import com.google.android.gms.common.images.WebImage
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import vid.mat.app.util.AppLogger
+
+class CastManager(private val context: Context) {
+
+    enum class CastState {
+        DISCONNECTED,
+        AVAILABLE,
+        CONNECTED,
+        LOADING,
+        ERROR
+    }
+
+    private val _castState = MutableStateFlow(CastState.DISCONNECTED)
+    val castState: StateFlow<CastState> = _castState.asStateFlow()
+
+    val isCasting: Boolean
+        get() = _castState.value == CastState.CONNECTED || _castState.value == CastState.LOADING
+
+    private var castContext: CastContext? = null
+    private var currentSession: CastSession? = null
+    private var pendingStream: StreamInfo? = null
+    private var lastKnownPositionMs: Long = 0L
+    private var _lastErrorMessage: String? = null
+
+    val lastErrorMessage: String?
+        get() = _lastErrorMessage
+
+    data class StreamInfo(
+        val url: String,
+        val title: String,
+        val thumbnailUrl: String? = null,
+        val positionMs: Long = 0L,
+        val mimeType: String = inferMimeType(url),
+        val userAgent: String? = null,
+        val isLive: Boolean = false
+    )
+
+    private val sessionListener = object : SessionManagerListener<CastSession> {
+        override fun onSessionStarted(session: CastSession, sessionId: String) {
+            currentSession = session
+            val pending = pendingStream
+            if (pending != null) {
+                _castState.value = CastState.LOADING
+                loadOnSession(session, pending)
+            } else {
+                _castState.value = CastState.CONNECTED
+            }
+        }
+
+        override fun onSessionResumed(session: CastSession, wasSuspended: Boolean) {
+            currentSession = session
+            val pending = pendingStream
+            if (pending != null) {
+                _castState.value = CastState.LOADING
+                if (!remoteMediaMatches(pending)) loadOnSession(session, pending)
+                else _castState.value = CastState.CONNECTED
+            } else {
+                _castState.value = CastState.CONNECTED
+            }
+        }
+
+        override fun onSessionEnded(session: CastSession, error: Int) {
+            currentSession = null
+            _castState.value = CastState.DISCONNECTED
+        }
+
+        override fun onSessionSuspended(session: CastSession, reason: Int) {
+            _castState.value = CastState.AVAILABLE
+        }
+
+        override fun onSessionStartFailed(session: CastSession, error: Int) {
+            currentSession = null
+            _castState.value = CastState.AVAILABLE
+        }
+
+        override fun onSessionStarting(session: CastSession) {
+            _castState.value = CastState.LOADING
+        }
+
+        override fun onSessionEnding(session: CastSession) {
+            _castState.value = CastState.LOADING
+        }
+
+        override fun onSessionResumeFailed(session: CastSession, error: Int) {
+            AppLogger.w("CastManager", "Cast session resume failed with error code: $error")
+            currentSession = null
+            _castState.value = CastState.AVAILABLE
+        }
+
+        override fun onSessionResuming(session: CastSession, sessionId: String) {
+            _castState.value = CastState.LOADING
+        }
+    }
+
+    fun register() {
+        try {
+            castContext = CastContext.getSharedInstance(context)
+            castContext?.sessionManager?.addSessionManagerListener(
+                sessionListener, CastSession::class.java
+            )
+            val existingSession = castContext?.sessionManager?.currentCastSession
+            if (existingSession != null && existingSession.isConnected) {
+                currentSession = existingSession
+                _castState.value = CastState.CONNECTED
+            } else {
+                _castState.value = CastState.DISCONNECTED
+            }
+        } catch (e: Exception) {
+            AppLogger.e("CastManager", "Google Play Services Cast framework unavailable", e)
+            _castState.value = CastState.DISCONNECTED
+        }
+    }
+
+    fun unregister() {
+        try {
+            castContext?.sessionManager?.removeSessionManagerListener(
+                sessionListener, CastSession::class.java
+            )
+        } catch (e: Exception) {
+            AppLogger.w("CastManager", "Failed to unregister session listener: ${e.message}")
+        }
+    }
+
+    fun prepareStream(stream: StreamInfo) {
+        pendingStream = stream
+        val session = currentSession
+        if (session != null && session.isConnected) {
+            _castState.value = CastState.LOADING
+            loadOnSession(session, stream)
+        }
+    }
+
+    fun castStream(stream: StreamInfo) {
+        prepareStream(stream)
+    }
+
+    val hasActiveMedia: Boolean
+        get() = pendingStream != null && (currentSession?.isConnected == true)
+
+    val currentStream: StreamInfo?
+        get() = pendingStream
+
+    val lastKnownRemotePositionMs: Long
+        get() = try {
+            val position = currentSession?.remoteMediaClient?.approximateStreamPosition ?: lastKnownPositionMs
+            position.coerceAtLeast(0L).also { lastKnownPositionMs = it }
+        } catch (_: Exception) {
+            lastKnownPositionMs
+        }
+
+    fun stopCasting(): Long {
+        val resumePos = lastKnownRemotePositionMs
+
+        try {
+            castContext?.sessionManager?.endCurrentSession(true)
+        } catch (e: Exception) {
+            AppLogger.w("CastManager", "Error ending cast session: ${e.message}")
+        }
+
+        currentSession = null
+        pendingStream = null
+        lastKnownPositionMs = resumePos
+        _lastErrorMessage = null
+        _castState.value = CastState.DISCONNECTED
+        return resumePos
+    }
+
+    fun pause() { currentSession?.remoteMediaClient?.pause() }
+    fun play() { currentSession?.remoteMediaClient?.play() }
+
+    val remotePositionMs: Long
+        get() = lastKnownRemotePositionMs
+
+    private fun loadOnSession(session: CastSession, stream: StreamInfo) {
+        if (!isCastSupported(stream)) {
+            _lastErrorMessage = "This stream type is not supported for Cast playback."
+            _castState.value = CastState.ERROR
+            return
+        }
+        _lastErrorMessage = null
+        if (remoteMediaMatches(stream)) {
+            lastKnownPositionMs = lastKnownRemotePositionMs
+            _castState.value = CastState.CONNECTED
+            return
+        }
+
+        val metadata = MediaMetadata(MediaMetadata.MEDIA_TYPE_MOVIE).apply {
+            putString(MediaMetadata.KEY_TITLE, stream.title)
+            stream.thumbnailUrl?.let { thumb ->
+                addImage(WebImage(thumb.toUri()))
+            }
+        }
+
+        val mediaInfo = MediaInfo.Builder(stream.url)
+            .setStreamType(if (stream.isLive) MediaInfo.STREAM_TYPE_LIVE else MediaInfo.STREAM_TYPE_BUFFERED)
+            .setContentType(stream.mimeType)
+            .setMetadata(metadata)
+            .also { builder ->
+                if (!stream.userAgent.isNullOrBlank()) {
+                    val customData = org.json.JSONObject().apply {
+                        put("userAgent", stream.userAgent)
                     }
+                    builder.setCustomData(customData)
+                }
+            }
+            .build()
+
+        val loadRequest = MediaLoadRequestData.Builder()
+            .setMediaInfo(mediaInfo)
+            .setCurrentTime(if (stream.isLive) 0L else stream.positionMs)
+            .setAutoplay(true)
+            .build()
+
+        session.remoteMediaClient?.load(loadRequest)
+            ?.addStatusListener { status ->
+                if (status.isSuccess) {
+                    pendingStream = stream
+                    lastKnownPositionMs = if (stream.isLive) 0L else stream.positionMs.coerceAtLeast(0L)
+                    _castState.value = CastState.CONNECTED
+                } else {
+                    _lastErrorMessage = "The Cast device rejected the media."
+                    _castState.value = CastState.ERROR
+                }
+            }
+    }
+
+    private fun remoteMediaMatches(stream: StreamInfo): Boolean = try {
+        currentSession?.remoteMediaClient?.mediaInfo?.contentId == stream.url
+    } catch (_: Exception) {
+        false
+    }
+
+    private fun isCastSupported(stream: StreamInfo): Boolean {
+        val lower = stream.url.lowercase()
+        if (lower.startsWith("rtsp://") || lower.startsWith("rtsp:")) return false
+        if (stream.url.isBlank()) return false
+        return true
+    }
+
+    companion object {
+        private fun inferMimeType(url: String): String = when {
+            url.contains(".m3u8", ignoreCase = true) -> "application/x-mpegURL"
+            url.contains(".mpd", ignoreCase = true) -> "application/dash+xml"
+            url.contains(".mp4", ignoreCase = true) -> "video/mp4"
+            url.contains(".ts", ignoreCase = true) -> "video/MP2T"
+            url.contains("rtsp", ignoreCase = true) -> "video/rtsp"
+            else -> "video/mp4"
+        }
+    }
+}
+""",
+
+    "ui/player/PlayerCastController.kt": """package vid.mat.app.ui.player
+
+import android.net.Uri
+import android.view.View
+import android.widget.ImageView
+import android.widget.TextView
+import android.widget.Toast
+import androidx.appcompat.app.AppCompatActivity
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.repeatOnLifecycle
+import androidx.media3.common.MediaItem
+import com.google.android.gms.cast.framework.CastButtonFactory
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import vid.mat.app.R
+import vid.mat.app.cast.CastManager
+import vid.mat.app.databinding.ActivityMediaPlayerBinding
+import vid.mat.app.player.PlaybackDestination
+import vid.mat.app.player.PlaybackType
+import vid.mat.app.ui.MediaPlayerActivity
+import vid.mat.app.uimodel.NewPlayerViewModel
+import vid.mat.app.util.AppLogger
+
+class PlayerCastController(
+    private val activity: AppCompatActivity,
+    private val binding: ActivityMediaPlayerBinding,
+    private val viewModel: NewPlayerViewModel
+) {
+    private val castManager = CastManager(activity.applicationContext)
+    private var isCastPlaying = true
+    private var localPlaybackPausedForCast = false
+    private var wasCastingMedia = false
+    private var castPositionJob: Job? = null
+
+    @Suppress("UNCHECKED_CAST")
+    private fun <T : View> findOptionalView(name: String): T? {
+        val id = activity.resources.getIdentifier(name, "id", activity.packageName)
+        return if (id != 0) binding.root.findViewById(id) as? T else null
+    }
+
+    private val mediaRouteButton: View? get() = findOptionalView("mediaRouteButton")
+    private val castPlayPauseButton: ImageView? get() = findOptionalView("castPlayPauseButton")
+    private val castStopButton: View? get() = findOptionalView("castStopButton")
+    private val castMiniController: View? get() = findOptionalView("castMiniController")
+    private val castTitleText: TextView? get() = findOptionalView("castTitleText")
+    private val castStatusOverlay: TextView? get() = findOptionalView("castStatusOverlay")
+
+    fun initialize(mediaTitleProvider: () -> String) {
+        val routeButton = mediaRouteButton
+        if (routeButton is androidx.mediarouter.app.MediaRouteButton) {
+            try {
+                CastButtonFactory.setUpMediaRouteButton(activity.applicationContext, routeButton)
+                routeButton.visibility = View.VISIBLE
             } catch (e: Exception) {
-                AppLogger.w("BootCompletedReceiver", "Boot worker rescheduling warning: ${e.message}")
-            } finally {
-                pendingResult.finish()
+                routeButton.visibility = View.GONE
+                AppLogger.w("PlayerCastController", "Cast framework unavailable", e)
+            }
+        }
+
+        castPlayPauseButton?.setOnClickListener {
+            if (isCastPlaying) {
+                castManager.pause()
+                isCastPlaying = false
+            } else {
+                castManager.play()
+                isCastPlaying = true
+            }
+            castPlayPauseButton?.setImageResource(
+                if (isCastPlaying) R.drawable.ic_pause else R.drawable.ic_play
+            )
+        }
+
+        castStopButton?.setOnClickListener {
+            castManager.stopCasting()
+        }
+
+        activity.lifecycleScope.launch {
+            activity.repeatOnLifecycle(Lifecycle.State.STARTED) {
+                launch {
+                    viewModel.newPlayer.currentlyPlaying.collect { mediaItem ->
+                        prepareCurrentMedia(mediaItem, mediaTitleProvider)
+                    }
+                }
+                launch {
+                    castManager.castState.collect { state ->
+                        when (state) {
+                            CastManager.CastState.LOADING -> {
+                                showCastStatus("Connecting to Cast device...")
+                            }
+                            CastManager.CastState.CONNECTED -> {
+                                if (!castManager.hasActiveMedia) {
+                                    binding.playerView.visibility = View.VISIBLE
+                                    return@collect
+                                }
+                                wasCastingMedia = true
+                                startRemotePositionTracking()
+                                val position = castManager.lastKnownRemotePositionMs
+                                viewModel.newPlayer.handoffPlaybackTo(PlaybackDestination.CAST, position)
+                                localPlaybackPausedForCast = true
+                                showMiniController(true, mediaTitleProvider())
+                                showCastStatus("Now playing on TV")
+                                binding.playerView.visibility = View.INVISIBLE
+                            }
+                            CastManager.CastState.DISCONNECTED -> {
+                                stopRemotePositionTracking()
+                                showMiniController(false, mediaTitleProvider())
+                                binding.playerView.visibility = View.VISIBLE
+                                if (wasCastingMedia || viewModel.newPlayer.playbackDestination.value == PlaybackDestination.CAST) {
+                                    val resumePos = castManager.lastKnownRemotePositionMs
+                                    viewModel.newPlayer.handoffPlaybackTo(PlaybackDestination.LOCAL, resumePos)
+                                    showCastStatus("Cast ended; resumed locally")
+                                }
+                                wasCastingMedia = false
+                                localPlaybackPausedForCast = false
+                            }
+                            CastManager.CastState.AVAILABLE -> {
+                                showMiniController(false, mediaTitleProvider())
+                            }
+                            CastManager.CastState.ERROR -> {
+                                stopRemotePositionTracking()
+                                showMiniController(false, mediaTitleProvider())
+                                binding.playerView.visibility = View.VISIBLE
+                                if (wasCastingMedia || localPlaybackPausedForCast || viewModel.newPlayer.playbackDestination.value == PlaybackDestination.CAST) {
+                                    viewModel.newPlayer.handoffPlaybackTo(PlaybackDestination.LOCAL, castManager.lastKnownRemotePositionMs)
+                                }
+                                showCastStatus(castManager.lastErrorMessage ?: "Unable to play this stream on the Cast device.")
+                                localPlaybackPausedForCast = false
+                                wasCastingMedia = false
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private fun prepareCurrentMedia(mediaItem: MediaItem?, titleProvider: () -> String) {
+        val rawUri = mediaItem?.localConfiguration?.uri?.toString()?.trim().orEmpty()
+        if (rawUri.isBlank()) return
+
+        if (rawUri.startsWith("content://", ignoreCase = true) ||
+            rawUri.startsWith("file://", ignoreCase = true) ||
+            rawUri.startsWith("/") ||
+            rawUri.startsWith("http://127.0.0.1", ignoreCase = true) ||
+            rawUri.startsWith("http://localhost", ignoreCase = true)
+        ) {
+            return
+        }
+
+        val resolvedUrl = expandCastUrlIfNeeded(rawUri) ?: return
+        val session = viewModel.newPlayer.currentSession.value
+        val metadata = mediaItem?.mediaMetadata
+        val title = metadata?.displayTitle?.toString()
+            ?: metadata?.title?.toString()
+            ?: titleProvider()
+        val thumbnail = metadata?.artworkUri?.toString()
+        val isLive = session?.playbackType == PlaybackType.LIVE
+
+        castManager.prepareStream(
+            CastManager.StreamInfo(
+                url = resolvedUrl,
+                title = title.ifBlank { "Stream" },
+                thumbnailUrl = thumbnail,
+                positionMs = if (isLive) 0L else viewModel.newPlayer.currentPosition.coerceAtLeast(0L),
+                isLive = isLive
+            )
+        )
+    }
+
+    private fun expandCastUrlIfNeeded(rawUrl: String): String? {
+        if (!rawUrl.contains("/X-AUTH-INJECT/")) return rawUrl
+        val session = viewModel.newPlayer.currentSession.value ?: return null
+        val candidate = (activity as? MediaPlayerActivity)?.failoverEngine?.getActiveCandidate(session.mediaId)
+            ?: return null
+        val user = candidate.headers.xtreamUser ?: return null
+        val pass = candidate.headers.xtreamPass ?: return null
+        return rawUrl.replace(
+            "/X-AUTH-INJECT/",
+            "/${Uri.encode(user)}/${Uri.encode(pass)}/"
+        )
+    }
+
+    fun onResume() = castManager.register()
+
+    fun onPause() {
+        stopRemotePositionTracking()
+        castManager.unregister()
+    }
+
+    private fun startRemotePositionTracking() {
+        if (castPositionJob?.isActive == true) return
+        castPositionJob = activity.lifecycleScope.launch {
+            while (isActive && castManager.isCasting) {
+                viewModel.newPlayer.updateExternalPlaybackPosition(castManager.lastKnownRemotePositionMs)
+                delay(1_000L)
+            }
+        }
+    }
+
+    private fun stopRemotePositionTracking() {
+        castPositionJob?.cancel()
+        castPositionJob = null
+    }
+
+    private fun showMiniController(visible: Boolean, title: String) {
+        castMiniController?.visibility = if (visible) View.VISIBLE else View.GONE
+        castTitleText?.text = title.ifEmpty { "Casting to TV" }
+    }
+
+    private fun showCastStatus(message: String) {
+        val overlay = castStatusOverlay
+        if (overlay != null) {
+            overlay.text = message
+            overlay.visibility = View.VISIBLE
+            overlay.animate().alpha(1f).setDuration(200).withEndAction {
+                overlay.postDelayed({
+                    overlay.animate().alpha(0f).setDuration(400)
+                        .withEndAction { overlay.visibility = View.GONE }.start()
+                }, 2000L)
+            }.start()
+        } else {
+            Toast.makeText(activity, message, Toast.LENGTH_SHORT).show()
+        }
+    }
+}
+""",
+
+    "notification/BootCompletedReceiver.kt": """package vid.mat.app.notification
+
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import dagger.hilt.android.AndroidEntryPoint
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import vid.mat.app.data.database.VideoUrlDatabase
+import vid.mat.app.epg.EpgRefreshWorker
+import vid.mat.app.util.AppLogger
+import javax.inject.Inject
+
+@AndroidEntryPoint
+class BootCompletedReceiver : BroadcastReceiver() {
+
+    @Inject
+    lateinit var notificationManager: AppNotificationManager
+
+    @Inject
+    lateinit var database: VideoUrlDatabase
+
+    override fun onReceive(context: Context, intent: Intent) {
+        if (intent.action == Intent.ACTION_BOOT_COMPLETED || intent.action == "android.intent.action.QUICKBOOT_POWERON") {
+            AppLogger.i("BootCompletedReceiver", "Device reboot detected -> Re-initializing channels and scheduled EPG/DVR workers")
+            notificationManager.createAllNotificationChannels()
+
+            val pendingResult = goAsync()
+            CoroutineScope(Dispatchers.IO).launch {
+                try {
+                    val epgPrefs = context.getSharedPreferences("epg_prefs", Context.MODE_PRIVATE)
+                    val manualEpg = epgPrefs.getString("epg_url", "").orEmpty().trim()
+                    if (manualEpg.isNotBlank()) {
+                        EpgRefreshWorker.schedule(context, manualEpg)
+                    }
+                    database.playlistSourceDao().getAll()
+                        .mapNotNull { it.epgUrl?.trim()?.takeIf { url -> url.isNotBlank() } }
+                        .distinct()
+                        .forEach { url ->
+                            EpgRefreshWorker.schedule(context, url)
+                        }
+                } catch (e: Exception) {
+                    AppLogger.w("BootCompletedReceiver", "Boot worker rescheduling warning: ${e.message}")
+                } finally {
+                    pendingResult.finish()
+                }
             }
         }
     }
 }
-```
+""",
 
-#### `lifecycle/AppLifecycleSupervisor.kt` — Guard `WorkManager.getWorkInfosForUniqueWork().get()` and include `QUEUED` / recurring cleanup cleanly
-```kotlin
-suspend fun reconcileInterruptedRecordings() {
-    runCatching {
-        val dvrDao = database.dvrDao()
-        val workManager = WorkManager.getInstance(context)
-        val activeRecordings = dvrDao.getActiveRecordings()
+    "lifecycle/AppLifecycleSupervisor.kt": """package vid.mat.app.lifecycle
 
-        for (recording in activeRecordings) {
-            var isJobAlive = false
-            if (!recording.workRequestId.isNullOrBlank()) {
-                val workInfos = runCatching {
-                    workManager.getWorkInfosForUniqueWork("dvr_work_${recording.id}").get()
-                }.getOrDefault(emptyList())
-                isJobAlive = workInfos.any {
-                    it.state == WorkInfo.State.RUNNING || it.state == WorkInfo.State.ENQUEUED
+import android.content.Context
+import androidx.lifecycle.DefaultLifecycleObserver
+import androidx.lifecycle.LifecycleOwner
+import androidx.work.WorkInfo
+import androidx.work.WorkManager
+import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
+import vid.mat.app.data.database.VideoUrlDatabase
+import vid.mat.app.dvr.DvrRepository
+import vid.mat.app.dvr.engine.ts.TsStreamSanitizer
+import vid.mat.app.dvr.model.DvrStatus
+import vid.mat.app.dvr.storage.DvrStorageManager
+import vid.mat.app.image.LogoImageLoader
+import vid.mat.app.util.AppLogger
+import vid.mat.app.util.ReleaseReadinessVerifier
+import java.io.File
+import java.io.FileInputStream
+import java.nio.ByteBuffer
+import javax.inject.Inject
+import javax.inject.Singleton
+
+@Singleton
+class AppLifecycleSupervisor @Inject constructor(
+    @ApplicationContext private val context: Context,
+    private val database: VideoUrlDatabase,
+    private val dvrRepository: DvrRepository,
+    private val storageManager: DvrStorageManager,
+    private val readinessVerifier: ReleaseReadinessVerifier
+) : DefaultLifecycleObserver {
+
+    companion object {
+        private const val TAG = "AppLifecycleSupervisor"
+    }
+
+    private val supervisorScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    fun onApplicationCreated() {
+        supervisorScope.launch {
+            readinessVerifier.verifySystemHealth()
+            reconcileInterruptedRecordings()
+            reconcileOrphanedSyncStates()
+        }
+    }
+
+    private suspend fun reconcileOrphanedSyncStates() {
+        runCatching {
+            database.playlistSourceDao().resetOrphanedSyncStates()
+        }.onFailure { e ->
+            AppLogger.e(TAG, "Failed to reconcile orphaned sync states", e)
+        }
+    }
+
+    override fun onStop(owner: LifecycleOwner) {
+        super.onStop(owner)
+        AppLogger.i(TAG, "Application entered background. Trimming non-essential memory.")
+        try {
+            LogoImageLoader.get(context).memoryCache?.clear()
+            database.openHelper.writableDatabase.execSQL("PRAGMA shrink_memory;")
+        } catch (e: Exception) {
+            AppLogger.w(TAG, "Background memory trim failed: ${e.message}")
+        }
+    }
+
+    suspend fun reconcileInterruptedRecordings() {
+        runCatching {
+            val dvrDao = database.dvrDao()
+            val workManager = WorkManager.getInstance(context)
+            val activeRecordings = dvrDao.getActiveRecordings()
+
+            for (recording in activeRecordings) {
+                var isJobAlive = false
+                if (!recording.workRequestId.isNullOrBlank()) {
+                    val workInfos = runCatching {
+                        workManager.getWorkInfosForUniqueWork("dvr_work_${recording.id}").get()
+                    }.getOrDefault(emptyList())
+                    isJobAlive = workInfos.any {
+                        it.state == WorkInfo.State.RUNNING || it.state == WorkInfo.State.ENQUEUED
+                    }
                 }
-            }
 
-            if (!isJobAlive) {
-                val finalFile = File(recording.outputFilePath)
-                val tempFile = storageManager.getTempWorkingFile(finalFile)
+                if (!isJobAlive) {
+                    val finalFile = File(recording.outputFilePath)
+                    val tempFile = storageManager.getTempWorkingFile(finalFile)
 
-                if (tempFile.exists() && tempFile.length() > 0L) {
-                    val hasValidStructure = validateDiskFileStructure(tempFile)
-                    if (hasValidStructure) {
-                        val resolvedFinalFile = storageManager.resolveFinalFileForCapturedTemp(tempFile, finalFile)
-                        val renamed = storageManager.finalizeAtomic(tempFile, resolvedFinalFile)
+                    if (tempFile.exists() && tempFile.length() > 0L) {
+                        val hasValidStructure = validateDiskFileStructure(tempFile)
+                        if (hasValidStructure) {
+                            val resolvedFinalFile = storageManager.resolveFinalFileForCapturedTemp(tempFile, finalFile)
+                            val renamed = storageManager.finalizeAtomic(tempFile, resolvedFinalFile)
+                            dvrDao.markRecordingFinished(
+                                id = recording.id,
+                                status = if (renamed) DvrStatus.PARTIAL else DvrStatus.FAILED,
+                                stopMs = System.currentTimeMillis(),
+                                fileSize = if (renamed) resolvedFinalFile.length() else 0L,
+                                segments = recording.segmentsDownloaded,
+                                failures = recording.segmentFailures,
+                                reconnects = recording.reconnectCount,
+                                error = "Interrupted by system process death. Salvaged.",
+                                outputPath = if (renamed) resolvedFinalFile.absolutePath else null
+                            )
+                        } else {
+                            tempFile.delete()
+                            dvrDao.markRecordingFinished(
+                                id = recording.id,
+                                status = DvrStatus.FAILED,
+                                stopMs = System.currentTimeMillis(),
+                                fileSize = 0L,
+                                segments = 0,
+                                failures = 0,
+                                reconnects = 0,
+                                error = "Terminated due to corrupted stream data on process death"
+                            )
+                        }
+                    } else if (finalFile.exists() && finalFile.length() > 0L) {
                         dvrDao.markRecordingFinished(
                             id = recording.id,
-                            status = if (renamed) DvrStatus.PARTIAL else DvrStatus.FAILED,
+                            status = DvrStatus.PARTIAL,
                             stopMs = System.currentTimeMillis(),
-                            fileSize = if (renamed) resolvedFinalFile.length() else 0L,
-                            segments = recording.segmentsDownloaded,
-                            failures = recording.segmentFailures,
-                            reconnects = recording.reconnectCount,
-                            error = "Interrupted by system process death. Salvaged.",
-                            outputPath = if (renamed) resolvedFinalFile.absolutePath else null
+                            fileSize = finalFile.length(),
+                            segments = 0,
+                            failures = 0,
+                            reconnects = 0,
+                            error = "Interrupted during finalization"
                         )
                     } else {
-                        tempFile.delete()
                         dvrDao.markRecordingFinished(
                             id = recording.id,
                             status = DvrStatus.FAILED,
@@ -3376,418 +5839,177 @@ suspend fun reconcileInterruptedRecordings() {
                             segments = 0,
                             failures = 0,
                             reconnects = 0,
-                            error = "Terminated due to corrupted stream data on process death"
+                            error = "Terminated due to system process death"
                         )
                     }
-                } else if (finalFile.exists() && finalFile.length() > 0L) {
-                    dvrDao.markRecordingFinished(
-                        id = recording.id,
-                        status = DvrStatus.PARTIAL,
-                        stopMs = System.currentTimeMillis(),
-                        fileSize = finalFile.length(),
-                        segments = 0,
-                        failures = 0,
-                        reconnects = 0,
-                        error = "Interrupted during finalization"
-                    )
-                } else {
-                    dvrDao.markRecordingFinished(
-                        id = recording.id,
-                        status = DvrStatus.FAILED,
-                        stopMs = System.currentTimeMillis(),
-                        fileSize = 0L,
-                        segments = 0,
-                        failures = 0,
-                        reconnects = 0,
-                        error = "Terminated due to system process death"
-                    )
-                }
 
-                if (recording.isRecurring) {
-                    dvrRepository.scheduleNextRecurrence(recording)
+                    if (recording.isRecurring) {
+                        dvrRepository.scheduleNextRecurrence(recording)
+                    }
                 }
             }
+
+            val allValidRecordings = dvrDao.getAllRecordingsFlow().first()
+            val validPaths = allValidRecordings
+                .filter { it.status == DvrStatus.COMPLETED || it.status == DvrStatus.PARTIAL }
+                .map { it.outputFilePath }
+                .toSet()
+            storageManager.cleanupOrphanedFiles(validPaths)
+        }.onFailure { e ->
+            AppLogger.e(TAG, "Error executing DVR reconciliation on startup", e)
         }
-
-        val allValidRecordings = dvrDao.getAllRecordingsFlow().first()
-        val validPaths = allValidRecordings
-            .filter { it.status == DvrStatus.COMPLETED || it.status == DvrStatus.PARTIAL }
-            .map { it.outputFilePath }
-            .toSet()
-        storageManager.cleanupOrphanedFiles(validPaths)
-    }.onFailure { e ->
-        AppLogger.e(TAG, "Error executing DVR reconciliation on startup", e)
-    }
-}
-```
-
-#### `ui/player/PlaybackLifecycleCoordinator.kt` — Update PiP actions dynamically on play/pause & avoid `startService` crash on `ACTION_STOP_PLAYBACK`
-```kotlin
-fun updatePiPState(isPlaying: Boolean) {
-    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && activity.isInPictureInPictureMode) {
-        val w = if (binding.playerView.width > 0) binding.playerView.width else 16
-        val h = if (binding.playerView.height > 0) binding.playerView.height else 9
-        val rawRatio = w.toFloat() / h.toFloat()
-        val safeRatio = when {
-            rawRatio < 0.41841f -> Rational(100, 239)
-            rawRatio > 2.39f -> Rational(239, 100)
-            else -> Rational(w, h)
-        }
-        val pipParams = PictureInPictureParams.Builder().setAspectRatio(safeRatio)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            pipParams.setActions(buildPiPActions(isPlaying))
-        }
-        runCatching { activity.setPictureInPictureParams(pipParams.build()) }
-    }
-}
-
-// Inside registerReceivers() -> pipActionReceiver -> ACTION_STOP_PLAYBACK:
-MediaPlayerActivity.ACTION_STOP_PLAYBACK -> {
-    activity.stopService(Intent(activity, PlaybackService::class.java))
-    activity.finish()
-}
-```
-
-#### `ui/MediaPlayerActivity.kt` — Sync PiP remote action icons when playback state changes
-```kotlin
-// Inside observeViewModel() uiState collector:
-if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && isInPictureInPictureMode) {
-    lifecycleCoordinator.updatePiPState(state.isPlaying)
-}
-```
-
----
-
-### Phase 15 Completion Notes
-- **Completed in code above**:
-  - `CastManager` & `PlayerCastController`: expands `/X-AUTH-INJECT/` credentials via the active candidate before casting, skips uncastable local/loopback URIs (`content://`, `file://`, `127.0.0.1`), and sets `MediaInfo.STREAM_TYPE_LIVE` for Live TV.
-  - `BootCompletedReceiver`: reschedules `EpgRefreshWorker` for manual and playlist EPG URLs after reboot using `goAsync()`.
-  - `AppLifecycleSupervisor`: wraps `WorkManager.getWorkInfosForUniqueWork().get()` safely and retains only `COMPLETED`/`PARTIAL` paths during orphan file sweep.
-  - `PlaybackLifecycleCoordinator` & `MediaPlayerActivity`: refreshes PiP action buttons (Play vs Pause) while in PiP mode and uses safe `stopService(...)` on `ACTION_STOP_PLAYBACK`.
-- **Orphaned duplicate noted for Phase 16 cleanup**: `ui/player/pip/PipController.kt` (superseded by `PlaybackLifecycleCoordinator`).
-
-Confirm when you are ready to proceed to **Phase 16 — UI completion, performance, and final production verification**.
-Below are **only the new or modified methods, attributes, and targeted edits** for **Phase 16 — UI Completion, Performance, and Final Production Verification**.
-
-*(No full classes are repeated.)*
-
----
-
-### 1. Startup Routing (`ui/SplashActivity.kt`)
-
-#### `ui/SplashActivity.kt` — Route first-launch Onboarding and Android TV (`TvMainActivity`) properly
-```kotlin
-private fun navigateNormal() {
-    val isTv = vid.mat.app.util.performance.DeviceCapabilityProfile.isTelevision(this)
-    val mainTarget = if (isTv) {
-        vid.mat.app.tv.TvMainActivity::class.java
-    } else {
-        MainActivity::class.java
     }
 
-    startActivity(Intent(this, mainTarget))
-    if (!isTv && OnboardingActivity.shouldShow(this)) {
-        startActivity(Intent(this, OnboardingActivity::class.java))
-    }
-    finish()
-}
-```
+    private fun validateDiskFileStructure(file: File): Boolean {
+        if (!file.exists() || file.length() < 188L * 4) return false
+        return try {
+            FileInputStream(file).use { fis ->
+                val header = ByteArray(188 * 16)
+                val read = fis.read(header)
+                if (read < 188 * 4) return false
+                if (TsStreamSanitizer.hasValidMpegTsStructure(header)) return true
 
----
-
-### 2. Home Dashboard Compilation, Routing & Recycler Performance (`home/SmartHomeDashboardRepository.kt`, `HomeDashboardFragment.kt`, `HomeDashboardSectionAdapter.kt`)
-
-#### `home/SmartHomeDashboardRepository.kt` — Fix `SeriesCard` Room PK (`s.id`) & populate Live/Movies/Series sections when available
-```kotlin
-// Inside buildSections(inputs: DashboardInputs), fix SeriesCard ID (`s.id.toLong()` / `s.id` instead of Int `s.seriesId`):
-filteredFavSeries.forEach { s ->
-    favoriteCards.add(
-        HomeCardItem.SeriesCard(
-            id = "fav_series_${s.id}",
-            title = s.title,
-            subtitle = s.genre ?: s.categoryName,
-            imageUrl = s.coverUrl ?: s.backdropUrl,
-            seriesId = s.id
-        )
-    )
-}
-```
-
-#### `home/ui/HomeDashboardFragment.kt` — Fix empty-state visibility bug (`rootView` hid entire Activity window!) & pass `thumbnailUrl` on Continue cards
-```kotlin
-private fun observeDashboard() {
-    viewLifecycleOwner.lifecycleScope.launch {
-        viewLifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {
-            viewModel.dashboardState.collect { state ->
-                sectionAdapter.submitList(state.sections)
-                // Toggle only the empty-state container, NOT binding.layoutEmpty.rootView (which is the Window decor!)
-                binding.layoutEmpty.root.visibility =
-                    if (state.sections.isEmpty() && !state.isLoading) View.VISIBLE else View.GONE
+                val boxType = String(header, 4, 4, Charsets.US_ASCII)
+                if (boxType in setOf("ftyp", "styp", "moov", "moof", "sidx")) {
+                    return validateMp4Atoms(file)
+                }
+                false
             }
+        } catch (_: Exception) {
+            false
         }
+    }
+
+    private fun validateMp4Atoms(file: File): Boolean {
+        var hasMoovOrMoof = false
+        var hasMdat = false
+        try {
+            FileInputStream(file).use { fis ->
+                var offset = 0L
+                val fileLength = file.length()
+                val buffer = ByteArray(8)
+                while (offset < fileLength) {
+                    val read = fis.read(buffer)
+                    if (read < 8) break
+
+                    val size32 = ByteBuffer.wrap(buffer, 0, 4).int.toLong() and 0xFFFFFFFFL
+                    val type = String(buffer, 4, 4, Charsets.US_ASCII)
+
+                    if (type == "moov" || type == "moof") hasMoovOrMoof = true
+                    if (type == "mdat") hasMdat = true
+
+                    val size = if (size32 == 1L) {
+                        val extBuf = ByteArray(8)
+                        fis.read(extBuf)
+                        ByteBuffer.wrap(extBuf).long
+                    } else size32
+
+                    if (size < 8L) return false
+
+                    val advance = if (size32 == 1L) size - 16L else size - 8L
+                    if (advance < 0 || offset + size > fileLength) {
+                        return false
+                    }
+                    fis.skip(advance)
+                    offset += size
+                }
+            }
+        } catch (_: Exception) {
+            return false
+        }
+        return hasMoovOrMoof && hasMdat
     }
 }
-
-// Inside handleCardClick(card: HomeCardItem) -> ContinueWatchingCard:
-is HomeCardItem.ContinueWatchingCard -> {
-    checkParentalGateAndRun(card.title, card.subtitle, card.id) {
-        val intent = Intent(requireContext(), MediaPlayerActivity::class.java).apply {
-            putExtra(MediaPlayerActivity.EXTRA_MEDIA_PATH, card.streamUrl)
-            putExtra(MediaPlayerActivity.EXTRA_MEDIA_TITLE, card.title)
-            putExtra(MediaPlayerActivity.EXTRA_MEDIA_THUMBNAIL, card.imageUrl)
-            putExtra(MediaPlayerActivity.EXTRA_RESUME_POSITION, card.resumePositionMs)
-            putExtra("group_title", card.subtitle)
-        }
-        startActivity(intent)
-    }
-}
-```
-
-#### `home/ui/HomeDashboardSectionAdapter.kt` — Reuse horizontal adapter & shared `RecycledViewPool` instead of recreating per bind
-```kotlin
-// Add shared pool on HomeDashboardSectionAdapter:
-private val sharedCardPool = vid.mat.app.util.performance.OptimizedViewPoolFactory.getSharedViewPool()
-
-override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): SectionViewHolder {
-    val binding = ItemHomeSectionRowBinding.inflate(LayoutInflater.from(parent.context), parent, false)
-    return SectionViewHolder(binding, onCardClick, sharedCardPool)
+"""
 }
 
-class SectionViewHolder(
-    private val binding: ItemHomeSectionRowBinding,
-    onCardClick: (HomeCardItem) -> Unit,
-    sharedPool: RecyclerView.RecycledViewPool
-) : RecyclerView.ViewHolder(binding.root) {
 
-    private val cardAdapter = MediaCardAdapter(onCardClick)
+def main() -> None:
+    if not BASE_DIR.exists():
+        raise SystemExit(f"Target directory does not exist: {BASE_DIR}")
 
-    init {
-        binding.rvSectionItems.apply {
-            layoutManager = LinearLayoutManager(binding.root.context, LinearLayoutManager.HORIZONTAL, false)
-            adapter = cardAdapter
-            setRecycledViewPool(sharedPool)
-            setHasFixedSize(true)
-        }
-    }
+    for rel_path, content in FILES.items():
+        target = BASE_DIR / rel_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+        print(f"Updated: {target}")
 
-    fun bind(section: HomeSectionData) {
-        binding.tvSectionTitle.text = section.title
-        cardAdapter.submitList(section.items)
-    }
-}
+    print(f"Done. Wrote {len(FILES)} files.")
+
+
+if __name__ == "__main__":
+    main()
 ```
 
----
+May I proceed with the **final Batch 11 (7 remaining modified classes — PiP, Splash, Live Badge, Settings, Promo Coil/HMAC & Readiness Gate)** (`ui/player/PlaybackLifecycleCoordinator.kt`, `ui/SplashActivity.kt`, `ui/adapter/UrlListAdapter.kt`, `ui/settings/SettingsActivity.kt`, `ads/promo/PromoBannerImageLoader.kt`, `ads/promo/PromoSyncWorker.kt`, `util/ReleaseReadinessVerifier.kt`)? Or would you prefer me to split Batch 11 into 5 + 2?
+Here is the Python script for the **final Batch 11 (7 remaining modified classes)**:
 
-### 3. Live TV List Fragment Compilation & Badge Fixes (`UrlListFragment.kt`, `UrlListAdapter.kt`)
+1. `ui/player/PlaybackLifecycleCoordinator.kt` — Adds `updatePiPState(isPlaying)` to refresh PiP play/pause `RemoteAction` icons and uses safe `stopService(...)` on `ACTION_STOP_PLAYBACK`.
+2. `ui/SplashActivity.kt` — Routes Android TV devices to `TvMainActivity` and launches `OnboardingActivity` on mobile first-run.
+3. `ui/adapter/UrlListAdapter.kt` — Recognizes unified `channelIdentity` Live TV channels via `!item.tvgId.isNullOrBlank()`.
+4. `ui/settings/SettingsActivity.kt` — Wires optional cards/switches for Parental Controls, Profiles, Encrypted Backup/Restore, Auto Frame Rate, Auto-PiP, and Auto-Timeshift.
+5. `ads/promo/PromoBannerImageLoader.kt` — Migrates promo banner loading from Glide to Coil (`LogoImageLoader`) with `NetworkSecurityValidator` URL validation.
+6. `ads/promo/PromoSyncWorker.kt` — Uploads the real Keystore HMAC receipt signature via `CryptoUtils.signReceipt(...)`.
+7. `util/ReleaseReadinessVerifier.kt` — Runs `DatabaseMigrationHelper.verifyDatabaseIntegrity(db)` during system health verification.
 
-#### `ui/fragment/UrlListFragment.kt` — Fix missing imports & remove duplicate `playContinue`
-```kotlin
-// Add missing imports at top of file:
-import javax.inject.Inject
-import vid.mat.app.security.ParentalGatekeeper
-import vid.mat.app.ui.security.ParentalPinChallengeDialog
+```python
+#!/usr/bin/env python3
+from pathlib import Path
 
-// Remove the duplicate `private fun playContinue(history: WatchHistory)` (keep only the parental-checked version + `playContinueUnrestricted`).
-```
+BASE_DIR = Path("/home/username/AndroidStudioProjects/Ytvmate/app/src/main/java/vid/mat/app")
 
-#### `ui/adapter/UrlListAdapter.kt` — Fix `isLive` detection for unified `channelIdentity` items
-```kotlin
-protected fun isLive(item: VideoUrl) =
-    item.groupTitle?.contains("live", ignoreCase = true) == true ||
-        item.resolution?.contains("live", ignoreCase = true) == true ||
-        item.url.contains(".m3u8", ignoreCase = true) ||
-        !item.tvgId.isNullOrBlank()
-```
+FILES = {
+    "ui/player/PlaybackLifecycleCoordinator.kt": """package vid.mat.app.ui.player
 
----
+import android.app.PendingIntent
+import android.app.PictureInPictureParams
+import android.app.RemoteAction
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.graphics.drawable.Icon
+import android.os.Build
+import android.util.Rational
+import android.widget.Toast
+import androidx.annotation.RequiresApi
+import androidx.appcompat.app.AppCompatActivity
+import androidx.core.content.ContextCompat
+import androidx.lifecycle.lifecycleScope
+import androidx.preference.PreferenceManager
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.launch
+import vid.mat.app.R
+import vid.mat.app.databinding.ActivityMediaPlayerBinding
+import vid.mat.app.ui.MediaPlayerActivity
+import vid.mat.app.uimodel.NewPlayerViewModel
+import vid.mat.app.util.AppLogger
+import vid.mat.app.util.PlaybackService
+import vid.mat.app.util.SensitiveDataSanitizer
+import java.util.concurrent.atomic.AtomicBoolean
 
-### 4. Settings Integration & Preferences (`ui/settings/SettingsActivity.kt`)
-
-#### `ui/settings/SettingsActivity.kt` — Wire optional settings entries for Parental Controls, Profiles, Backup/Restore, and AFR/Auto-PiP/Timeshift preferences
-```kotlin
-// Extend setupClickListeners() using findOptView so existing layouts work without breaking missing IDs:
-private fun setupClickListeners() {
-    findOptView<View>("shareCard")?.setOnClickListener { shareApp.shareApp() }
-    findOptView<View>("rateCard")?.setOnClickListener { shareApp.rateApp() }
-    findOptView<View>("moreAppsCard")?.setOnClickListener { shareApp.viewMoreApps() }
-    findOptView<View>("policyCard")?.setOnClickListener { showPrivacyPolicy() }
-
-    findOptView<View>("parentalCard")?.setOnClickListener {
-        startActivity(Intent(this, vid.mat.app.ui.security.ParentalControlSettingsActivity::class.java))
-    }
-    findOptView<View>("profilesCard")?.setOnClickListener {
-        startActivity(Intent(this, vid.mat.app.profile.ui.ProfileSelectionActivity::class.java))
-    }
-    findOptView<View>("backupCreateCard")?.setOnClickListener {
-        vid.mat.app.backup.ui.BackupCreateDialogFragment.newInstance()
-            .show(supportFragmentManager, vid.mat.app.backup.ui.BackupCreateDialogFragment.TAG)
-    }
-    findOptView<View>("backupRestoreCard")?.setOnClickListener {
-        vid.mat.app.backup.ui.BackupRestoreDialogFragment.newInstance()
-            .show(supportFragmentManager, vid.mat.app.backup.ui.BackupRestoreDialogFragment.TAG)
-    }
-
-    val defaultPrefs = androidx.preference.PreferenceManager.getDefaultSharedPreferences(this)
-    findOptView<CompoundButton>("afrSwitch")?.apply {
-        isChecked = defaultPrefs.getBoolean("auto_frame_rate_enabled", true)
-        setOnCheckedChangeListener { _, isChecked ->
-            defaultPrefs.edit { putBoolean("auto_frame_rate_enabled", isChecked) }
-        }
-    }
-    findOptView<CompoundButton>("autoPipSwitch")?.apply {
-        isChecked = defaultPrefs.getBoolean("auto_pip_enabled", false)
-        setOnCheckedChangeListener { _, isChecked ->
-            defaultPrefs.edit { putBoolean("auto_pip_enabled", isChecked) }
-        }
-    }
-    findOptView<CompoundButton>("autoTimeshiftSwitch")?.apply {
-        isChecked = defaultPrefs.getBoolean("auto_timeshift_enabled", false)
-        setOnCheckedChangeListener { _, isChecked ->
-            defaultPrefs.edit { putBoolean("auto_timeshift_enabled", isChecked) }
-        }
-    }
-
-    val isDark = prefs.getBoolean("dark_mode", false)
-    val themeSwitch = findOptView<CompoundButton>("themeSwitch")
-    themeSwitch?.isChecked = isDark
-    themeSwitch?.setOnCheckedChangeListener { _, isChecked: Boolean ->
-        prefs.edit { putBoolean("dark_mode", isChecked) }
-        val mode = if (isChecked) AppCompatDelegate.MODE_NIGHT_YES else AppCompatDelegate.MODE_NIGHT_NO
-        AppCompatDelegate.setDefaultNightMode(mode)
-    }
-}
-```
-
----
-
-### 5. Promo Image Loader Coil Standardization & HMAC Sync Fix (`PromoBannerImageLoader.kt`, `PromoDatabaseEntities.kt`, `PromoImpressionTracker.kt`, `PromoSyncWorker.kt`)
-
-*(Replaces Glide dependency with Coil `LogoImageLoader` and stores/syncs the real HMAC signature.)*
-
-#### `ads/promo/PromoBannerImageLoader.kt` — Replace Glide with `LogoImageLoader` / Coil
-```kotlin
-fun load(
-    context: Context,
-    title: String,
-    logoUrl: String,
-    target: ImageView,
-    placeholderRes: Int,
-    errorRes: Int,
-    cornerDp: Float = 8f
+class PlaybackLifecycleCoordinator(
+    private val activity: AppCompatActivity,
+    private val binding: ActivityMediaPlayerBinding,
+    private val viewModel: NewPlayerViewModel,
+    private val onError: (String) -> Unit
 ) {
-    val px = cornerDp * context.resources.displayMetrics.density
-    val sanitizedUrl = when (
-        val res = vid.mat.app.security.NetworkSecurityValidator.validateUri(
-            logoUrl,
-            vid.mat.app.security.NetworkSecurityContext.PUBLIC_WEB
-        )
-    ) {
-        is vid.mat.app.security.NetworkSecurityValidator.UrlValidationResult.Valid -> res.sanitizedUrl
-        is vid.mat.app.security.NetworkSecurityValidator.UrlValidationResult.Invalid -> null
+    companion object {
+        private const val TAG = "PlaybackLifecycleCoord"
     }
 
-    val request = coil.request.ImageRequest.Builder(context)
-        .data(sanitizedUrl)
-        .target(target)
-        .placeholder(placeholderRes)
-        .error(errorRes)
-        .fallback(errorRes)
-        .scale(coil.size.Scale.FILL)
-        .apply {
-            if (px > 0f) transformations(coil.transform.RoundedCornersTransformation(px))
+    private var playerObservationJob: Job? = null
+    private var pipActionReceiver: BroadcastReceiver? = null
+    private var playbackErrorReceiver: BroadcastReceiver? = null
+    private val isReceiverRegistered = AtomicBoolean(false)
+
+    fun startPlaybackService(mediaData: PlayerMediaData) {
+        val serviceIntent = Intent(activity, PlaybackService::class.java).apply {
+            action = PlaybackService.ACTION_START_PLAYBACK
+            putExtra(PlaybackService.EXTRA_MEDIA_PATH, mediaData.mediaPath)
+            putExtra(PlaybackService.EXTRA_MEDIA_TITLE, mediaData.mediaTitle)
+            putExtra(PlaybackService.EXTRA_RESUME_POSITION, mediaData.resumePosition)
+            putExtra(PlaybackService.EXTRA_THUMBNAIL_URI, mediaData.thumbnailUrl)
         }
-        .build()
-    vid.mat.app.image.LogoImageLoader.get(context).enqueue(request)
-}
-```
-
-#### `ads/promo/PromoSyncWorker.kt` — Recompute device HMAC signature on upload instead of truncating `clientReceiptNonce`
-```kotlin
-// Inside doWork() loop:
-val signature = vid.mat.app.security.CryptoUtils.signReceipt(
-    receiptId = receipt.receiptId,
-    promoId = receipt.promoId,
-    timestampMs = receipt.timestampMs,
-    elapsedMs = receipt.elapsedMs,
-    nonce = receipt.clientReceiptNonce
-)
-val receiptData = hashMapOf(
-    "receipt_id" to receipt.receiptId,
-    "promo_id" to receipt.promoId,
-    "device_id" to tracker.deviceId,
-    "timestamp_ms" to receipt.timestampMs,
-    "elapsed_ms" to receipt.elapsedMs,
-    "signature" to signature,
-    "synced_at" to FieldValue.serverTimestamp()
-)
-```
-
----
-
-### 6. Database Integrity Gate in `ReleaseReadinessVerifier.kt`
-
-#### `util/ReleaseReadinessVerifier.kt` — Verify SQLite integrity & profile initialization cleanly
-```kotlin
-fun verifySystemHealth(): VerificationReport {
-    AppLogger.i(TAG, "Executing release health verification gate")
-
-    val isKeystoreOk = runCatching {
-        CryptoUtils.encrypt("SYSTEM_INTEGRITY_VERIFICATION_PAYLOAD") is CryptoUtils.EncryptionResult.Success
-    }.getOrDefault(false)
-
-    val isDatabaseUsable = runCatching {
-        val db = database.openHelper.writableDatabase
-        db.isOpen && vid.mat.app.data.database.DatabaseMigrationHelper.verifyDatabaseIntegrity(db)
-    }.getOrDefault(false)
-
-    val isFfmpegAvailable = runCatching {
-        FfmpegRendererFactory.isFfmpegAvailable()
-    }.getOrDefault(false)
-
-    val areNotificationsReady = runCatching {
-        notificationManager.createAllNotificationChannels()
-        true
-    }.getOrDefault(false)
-
-    val isProfileOk = runCatching {
-        activeProfileProvider.activeProfile.value.id > 0L
-    }.getOrDefault(false)
-
-    val isReady = isKeystoreOk && isDatabaseUsable && areNotificationsReady && isProfileOk
-
-    AppLogger.i(
-        TAG,
-        "Release verification: keystore=$isKeystoreOk, databaseUsable=$isDatabaseUsable, " +
-            "ffmpegAvailable=$isFfmpegAvailable, notificationsReady=$areNotificationsReady, " +
-            "profileActive=$isProfileOk, overallReady=$isReady"
-    )
-
-    return VerificationReport(
-        isKeystoreFunctional = isKeystoreOk,
-        isDatabaseUsable = isDatabaseUsable,
-        isFfmpegAvailable = isFfmpegAvailable,
-        areNotificationsReady = areNotificationsReady,
-        isProfileSystemActive = isProfileOk,
-        isOverallReady = isReady
-    )
-}
-```
-
----
-
-### 7. Remaining Constructor-Arg DialogFragments (Rotation-Safe Cleanup Note)
-In addition to `ScheduleRecordingDialogFragment` (fixed in Phase 6) and `TvChannelActionMenuDialog` (fixed in Phase 13), the following dialogs still use constructor arguments in the source tree and should follow the same no-arg + `Bundle` / `activityViewModels()` pattern when their XML layouts are built:
-- `ui/player/AdvancedPlayerSettingsBottomSheet`
-- `ui/player/StreamStatsBottomSheet`
-- `ui/player/StreamPerformanceCenterBottomSheet`
-- `ui/dialog/SourceSelectorBottomSheet`
-- `ui/organization/EditChannelOverrideDialogFragment`
-- `error/StreamDiagnosticsFragment`
-
----
-
-### Final Project Status Summary (Phases 0–16)
-- **All P0 compile errors addressed**: `ChannelDao`, `ChannelRepository`, `PlaylistIntelligenceEngine`, `SmartHomeDashboardRepository`, `MediaPlayerActivity`, `UrlListFragment`, `VodDetailsActivity`, `SeriesDetailsActivity`, `TvChannelPresenter`.
-- **All 16 implementation phases completed** at the Kotlin method/class-integration level without adding out-of-scope features or breaking Room schema v21.
-- **Unverified without full build project**: XML layout IDs, `nav_graph.xml` / menu XMLs, `AndroidManifest.xml`, Hilt codegen compilation, and physical mobile/Android TV device playback & DVR runs.
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
